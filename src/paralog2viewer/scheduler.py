@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Dependency-aware worker pool with core pinning and memory guard.
+"""Dependency-aware worker pool with a thread and memory budget.
 
 Every task runs in its own forked process, so its wall time, CPU time and
 peak resident memory can be measured per task (``RUSAGE_SELF`` plus
@@ -10,8 +10,7 @@ Resource limits:
 
 * CPU: the sum of ``Task.threads`` of running tasks never exceeds the pool
   budget (a counting semaphore of thread weights, kept by the parent).
-  :func:`apply_affinity` additionally pins the whole process tree to a CPU
-  list; children inherit the mask.
+  Children inherit the CPU affinity of the process; nothing is pinned here.
 * Memory: the sum of ``Task.memory_gb`` estimates of running tasks never
   exceeds the budget. The numbers are estimates, not measurements.
 
@@ -172,58 +171,6 @@ class GlobalStepError(RuntimeError):
         super().__init__(f"{key} failed: {message}")
         self.key = key
         self.report = report
-
-
-def parse_cpu_list(text: str) -> tuple[int, ...]:
-    """Parses a CPU list such as ``0-19,48-67``.
-
-    Raises:
-        ValueError: On an empty or malformed list.
-    """
-    cpus: set[int] = set()
-    for part in text.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        match = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
-        if not match:
-            raise ValueError(f"invalid CPU list item {part!r}")
-        low = int(match.group(1))
-        high = int(match.group(2) or low)
-        if high < low:
-            raise ValueError(f"invalid CPU range {part!r}")
-        cpus.update(range(low, high + 1))
-    if not cpus:
-        raise ValueError("empty CPU list")
-    return tuple(sorted(cpus))
-
-
-def apply_affinity(cpus: Sequence[int] | None) -> tuple[int, ...]:
-    """Pins this process (and so all later children) to ``cpus``.
-
-    Args:
-        cpus: Logical CPU numbers; None leaves the mask unchanged.
-
-    Returns:
-        The affinity mask in effect afterwards, read back from the kernel.
-
-    Raises:
-        SchedulerError: If a CPU is not available or the mask differs after
-            setting it.
-    """
-    if cpus is None:
-        return tuple(sorted(os.sched_getaffinity(0)))
-    wanted = set(cpus)
-    missing = wanted - set(os.sched_getaffinity(0))
-    if missing:
-        raise SchedulerError(
-            f"CPUs not available to this process: {sorted(missing)}"
-        )
-    os.sched_setaffinity(0, wanted)
-    actual = set(os.sched_getaffinity(0))
-    if actual != wanted:
-        raise SchedulerError(f"affinity is {sorted(actual)}, not requested")
-    return tuple(sorted(actual))
 
 
 @contextlib.contextmanager

@@ -299,18 +299,6 @@ def test_work_lock_blocks_second_holder(tmp_path):
         pass
 
 
-def test_cpu_list_and_affinity(tmp_path):
-    assert scheduler.parse_cpu_list("0-2,5") == (0, 1, 2, 5)
-    for bad in ("", "3-1", "a"):
-        with pytest.raises(ValueError):
-            scheduler.parse_cpu_list(bad)
-    current = tuple(sorted(os.sched_getaffinity(0)))
-    assert scheduler.apply_affinity(None) == current
-    assert scheduler.apply_affinity(current) == current
-    with pytest.raises(SchedulerError, match="not available"):
-        scheduler.apply_affinity([max(current) + 1000])
-
-
 def test_result_sent_just_before_exit_is_not_a_death(tmp_path, monkeypatch):
     """poll() False, worker exits after sending: the result must be kept."""
     pool = _pool(tmp_path)

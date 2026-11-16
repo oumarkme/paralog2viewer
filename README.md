@@ -1,5 +1,11 @@
 # paralog2viewer
 
+[![version](https://img.shields.io/badge/version-0.9.0-0072B2)](https://github.com/oumarkme/paralog2viewer/pkgs/container/paralog2viewer)
+[![license](https://img.shields.io/badge/license-GPL--3.0--or--later-009E73)](https://www.gnu.org/licenses/gpl-3.0.html)
+[![container](https://img.shields.io/badge/container-ghcr.io-56B4E9?logo=docker&logoColor=white)](https://github.com/oumarkme/paralog2viewer/pkgs/container/paralog2viewer)
+[![python](https://img.shields.io/badge/python-3.11-E69F00?logo=python&logoColor=white)](https://www.python.org/)
+[![genome](https://img.shields.io/badge/genome-GRCh38-CC79A7)](https://www.ncbi.nlm.nih.gov/grc/human)
+
 Per-haplotype variant calls, annotation, and read-pileup figures for paralogous genes, starting from an Oxford Nanopore (ONT) Paraphase result.
 
 Version 0.9.0 (pre-release). License GPL-3.0-or-later. Research use only, not a clinical diagnostic.
@@ -10,20 +16,60 @@ For each sample you get one annotated variant call format (VCF) file, one 365-co
 
 Input: an existing Paraphase BAM, its `.bai` index, and its JSON. Paraphase is not rerun.
 
-```
-Paraphase BAM + .bai + JSON
-  [0] check    BAM dictionary vs GRCh38 FASTA, data manifest, unique HP values
-  [1] split    confident primary reads (RN, HP, YC tags) per gene region and haplotype
-  [2] realign  minimap2 (map-ont) from raw sequence -> calling BED per haplotype
-  [3] call     Clair3 (SNV/indel) and Sawfish (SV) per haplotype
-  [4] normalize bcftools norm; GT = 1, 0 or . (haploid)
-  [5] merge    one VCF, one sample column per HP value
-  [6] annotate unique alleles once: VEP, ANNOVAR, InterVar, ClinVar,
-               Taiwan Biobank, HGMD, OMIM (results cached in SQLite)
-  [7] write    annotated VCF, MViewer table, figures (+ RCCX figure), timings.tsv
+```mermaid
+flowchart TD
+    IN["Paraphase BAM + .bai + JSON"]:::input
+    SRC["Annotation sources<br/>VEP cache, ANNOVAR, InterVar, ClinVar,<br/>Taiwan Biobank, HGMD, OMIM, GRCh38"]:::input
+    BUILD["build-data (one time)<br/>locus subsets, manifest,<br/>RCCX discriminating sites"]:::once
+    DATA[("data directory")]:::input
+    SRC --> BUILD --> DATA
+
+    IN --> CHECK["0 check<br/>BAM dictionary vs FASTA,<br/>data manifest, unique HP values"]:::global
+    DATA --> CHECK
+    CHECK --> SPLIT["1 split<br/>confident primary reads<br/>(RN, HP, YC tags)"]:::global
+
+    subgraph PER["per haplotype, in parallel"]
+        direction TB
+        REALIGN["2 realign<br/>minimap2 map-ont,<br/>calling BED"]:::hap
+        CALL["3 call<br/>Clair3 SNV/indel + Sawfish SV"]:::hap
+        NORM["4 normalize<br/>bcftools norm, haploid GT"]:::hap
+        REALIGN --> CALL --> NORM
+    end
+
+    SPLIT --> REALIGN
+    NORM --> MERGE["5 merge<br/>one VCF, one sample column per HP"]:::global
+    MERGE --> ANN["6 annotate unique alleles once<br/>VEP, ANNOVAR, InterVar, ClinVar,<br/>Taiwan Biobank, HGMD, OMIM<br/>(SQLite cache)"]:::global
+    DATA --> ANN
+    MERGE --> RCCX["RCCX module calls<br/>RP, C4, CYP21, TNX"]:::global
+    ANN --> VCF["SAMPLE.paralog.vcf.gz + .tbi"]:::output
+    ANN --> MV["SAMPLE.paralog.tsv.gz<br/>365 columns"]:::output
+    ANN --> FIG["figures/<br/>read pileup per region"]:::output
+    RCCX --> RFIG["figures/RCCX_module.jpeg"]:::output
+
+    classDef input fill:#DDDDDD,stroke:#000000,color:#000000
+    classDef once fill:#F0E442,stroke:#000000,color:#000000
+    classDef global fill:#E69F00,stroke:#000000,color:#000000
+    classDef hap fill:#56B4E9,stroke:#000000,color:#000000
+    classDef output fill:#009E73,stroke:#000000,color:#000000
 ```
 
+Gray: inputs and data. Yellow: one-time setup. Orange: steps run once per sample. Blue: steps run for every haplotype in parallel. Green: published outputs.
+
 In the merged VCF `GT` is `1` when the haplotype carries the allele, `0` when its reads cover the site and show the reference, and `.` when its reads do not cover the site.
+
+## Example figures
+
+The figures below come from an ONT run of the public Genome in a Bottle reference sample HG002, processed with `--sample HG002`.
+
+**SMN1 and SMN2.** Paraphase assigns each haplotype to SMN1 or SMN2, and each copy is drawn at its own locus, so the region gives two figures. From top to bottom, each figure shows the gene models with numbered exons, the alleles that differ between the haplotypes shown, and one band per haplotype. A band starts with the haplotype's gene and role (gene, paralog, or pseudogene). Below that come its read depth and up to 40 of its reads, with a tick on each read at every allele it carries. Lettered sites are named in the key below the axis; site A is SMN1 c.840C>T, the base that tells SMN1 from SMN2.
+
+![HG002 SMN1 haplotypes](docs/images/smn1_SMN1.jpeg)
+
+![HG002 SMN2 haplotype](docs/images/smn1_SMN2.jpeg)
+
+**RCCX module.** Each RCCX haplotype gets one box per gene (RP, C4, CYP21, TNX), with the module structure per allele, as described in [RCCX notes](#rccx-notes). In HG002, allele 1 is bimodular and allele 2 is monomodular. These calls are research output and have not been checked against published HG002 assemblies.
+
+![HG002 RCCX module figure](docs/images/rccx_module.jpeg)
 
 ## Quick start
 
@@ -31,13 +77,17 @@ Requirements: Apptainer (or Docker), a GRCh38 FASTA with `.fai` and `.dict`, and
 
 The image holds open-source tools only (Clair3, Sawfish, minimap2, samtools, bcftools, VEP, BLAST). These cannot be redistributed, so you must obtain them yourself: ANNOVAR (with its `humandb`), InterVar (with `intervardb`), and the profile tables (ClinVar, Taiwan Biobank, HGMD, OMIM genemap2, and the small tables PanelList, DefaultTranscript, Comments, Methylated). Mount ANNOVAR at `/opt/annovar` and InterVar at `/opt/intervar` inside the container.
 
-**1. Pull the image.** The GitHub package is private, so Apptainer needs a token with `read:packages`.
+**1. Pull the image.** The image is public on the GitHub Container Registry (GHCR), so no account or token is needed. It is built for linux/amd64.
 
 ```bash
-export APPTAINER_DOCKER_USERNAME=<github-user>
-export APPTAINER_DOCKER_PASSWORD=<token>
+# Apptainer (HPC): converts the image to one .sif file
 apptainer pull paralog2viewer.sif docker://ghcr.io/oumarkme/paralog2viewer:0.9.0
+
+# Docker
+docker pull ghcr.io/oumarkme/paralog2viewer:0.9.0
 ```
+
+The examples below use Apptainer. With Docker, replace `apptainer exec -B a:b paralog2viewer.sif` by `docker run --rm -u "$(id -u):$(id -g)" -v a:b ghcr.io/oumarkme/paralog2viewer:0.9.0`, with one `-v` per mount.
 
 **2. Build the data directory (one time).** `build-data` subsets every annotation source to the Paraphase loci plus padding (default 50 kb), rebuilds the indexes, precomputes RCCX discriminating sites, and writes `manifest.json` with checksums. The first build produced roughly 30 GB.
 
@@ -79,8 +129,8 @@ Written to `<outdir>/<SAMPLE_ID>/`:
 | File | Content |
 |---|---|
 | `{SAMPLE_ID}.paralog.vcf.gz`, `.tbi` | Merged, annotated VCF, one sample column per `HP` value |
-| `{SAMPLE_ID}.paralog.mviewer.gz` | 365-column MViewer-format table |
-| `figures/` | Read-pileup JPEG per region (or per locus when a region has haplotypes projected to different loci); RCCX module figure |
+| `{SAMPLE_ID}.paralog.tsv.gz` | 365-column MViewer-format table |
+| `figures/` | Read-pileup JPEG per region (`<region>.jpeg`), or one per locus named `<region>_<SYMBOL>.jpeg` (for example `pms2_PMS2.jpeg`, `pms2_PMS2CL.jpeg`) when a region has haplotypes projected to different loci; RCCX module figure |
 | `timings.tsv` | Wall time, CPU time, and peak memory per step |
 
 `--format vcf,mviewer` (default) writes both. `--format vcf` or `--format mviewer` writes one. Annotation runs in every case; a single-format run skips only the file writing. `--no-figures` skips plotting.
@@ -104,14 +154,10 @@ Written to `<outdir>/<SAMPLE_ID>/`:
 | `--figures`, `--no-figures` | figures on | Draw figures |
 | `--vcf-annotation` | `default` | `full` also adds selected ANNOVAR fields to the VCF |
 | `--pseudogene-tsv` | table shipped with the package | Pseudogene allele table |
-| `--threads` | 40 | CPU budget in threads |
-| `--cpus` | affinity unchanged | Pin the run to these logical CPUs, for example `0-19,48-67` |
-| `--max-memory-gb` | 800 | Memory budget for task estimates (estimates, not measurements) |
-| `--gpu` | off | Accepted, but currently has no effect (see below) |
+| `--threads` | all CPUs the process may use | Maximum CPU threads. The tool splits them across steps itself. To pin CPUs, start the tool with `taskset -c 0-19 paralog2viewer run ...` |
+| `--memory` | 80% of available memory | Maximum memory in GB (cgroup limit or `MemAvailable`, whichever is smaller) |
 | `--verify-checksums` | sizes only | Hash every data file at start (slow) |
 | `--dry-run` | off | Check inputs, print the planned steps, exit |
-
-`--gpu`: the Clair3 GPU option has not been verified against Clair3 2.0.3, so `GPU_FLAGS` in `call.py` is empty. With `--gpu` the run logs a warning and uses the CPU.
 
 ## Things to know about the table
 
@@ -134,8 +180,9 @@ Written to `<outdir>/<SAMPLE_ID>/`:
 
 ## Resources and speed
 
-- Default budget: 40 logical CPUs (`--threads`) and 800 GB of memory estimates (`--max-memory-gb`). Set lower values on a shared machine.
-- The first full run of a validation sample took about 10 minutes on a 40-CPU budget. The previous Nextflow pipeline took about 33 minutes on the same sample.
+- Give the tool the CPUs and memory it may use (`--threads`, `--memory`); it decides the rest. On a shared machine, set both below the machine total.
+- How the budget is used: each haplotype's Clair3 and Sawfish calls run on one thread, so up to `--threads` haplotypes run at once, largest first. Annotation then uses the whole budget, with VEP and ANNOVAR/InterVar side by side. RCCX calls run during annotation, and figures use one worker per region.
+- With `--threads 40`, a full run of one validation sample (83 to 107 haplotypes) took 128 to 138 s on our server, down from 456 to 568 s before calling ran one thread per haplotype. The previous Nextflow pipeline took about 33 minutes on the same sample.
 - `--tmp` should point to a fast local disk. I have not benchmarked network storage against local disk for this tool.
 - A finished step leaves a done-marker keyed by an input hash. A rerun with the same `--work-dir` skips it. The annotation cache also speeds up later samples.
 
@@ -158,27 +205,29 @@ pytest -q tests
 ruff check && ruff format --check
 ```
 
-The version lives in the `VERSION` file only. GitHub Actions (`.github/workflows/ci.yml`) builds the test image from `docker/Dockerfile`, runs ruff and pytest inside it, and on a push to `main` or a `v*` tag pushes the runtime image to `ghcr.io/oumarkme/paralog2viewer`. A tag must equal `v` plus the content of `VERSION`.
+The version lives in the `VERSION` file only. GitHub Actions (`.github/workflows/ci.yml`) builds the test image from `docker/Dockerfile`, runs ruff and pytest inside it, and on a push to `main` or a `v*` tag pushes the runtime image to `ghcr.io/oumarkme/paralog2viewer`. A tag must equal `v` plus the content of `VERSION`. GHCR creates a new package as private. After the first push, the owner sets it to public once (package page, Package settings, Change visibility); the repository itself can stay private.
 
 ## License and third-party tools
 
-paralog2viewer is GPL-3.0-or-later (see `LICENSE`). Third-party tools keep their own licenses. The table lists what a web lookup on 2026-11-13 found; "not verified" means no license text could be fetched, so check upstream before redistributing.
+paralog2viewer is GPL-3.0-or-later (see `LICENSE`). Third-party tools keep their own licenses. The table lists what web lookups on 2026-11-13 and 2026-11-16 found; "not verified" means no license text could be fetched, so check upstream before redistributing. The image contains Clair3, its ONT model, Sawfish, minimap2, samtools, bcftools, longphase, VEP and BLAST+; it does not contain Paraphase, ANNOVAR, InterVar or any annotation data. The Clair3 ONT model derives from Oxford Nanopore's Rerio models, which are licensed for research purposes only, so the image as a whole is for research use.
 
 | Tool | Role | License | Citation |
 |---|---|---|---|
 | [Paraphase](https://github.com/PacificBiosciences/paraphase) | Haplotype phasing (input) | PacBio Software License Agreement (not OSI) | Chen et al., Nat Commun 2025, doi:10.1038/s41467-025-57505-2 |
-| [Clair3](https://github.com/HKU-BAL/Clair3) | SNV/indel calling | BSD-3-Clause (README badge only) | Journal reference not verified (preprint doi:10.1101/2021.12.29.474431) |
-| [Sawfish](https://github.com/PacificBiosciences/sawfish) | SV calling | not verified | Saunders et al., Bioinformatics 2025, doi:10.1093/bioinformatics/btaf136 |
+| [Clair3](https://github.com/HKU-BAL/Clair3) | SNV/indel calling | BSD-3-Clause (LICENSE.md) | Journal reference not verified (preprint doi:10.1101/2021.12.29.474431) |
+| Clair3 ONT model r1041_e82_400bps_sup_v520 | Clair3 model (from [Rerio](https://github.com/nanoporetech/rerio)) | Oxford Nanopore Public License 1.0, research purposes only | none |
+| [Sawfish](https://github.com/PacificBiosciences/sawfish) | SV calling | PacBio Software License Agreement (not OSI; binary redistribution allowed) | Saunders et al., Bioinformatics 2025, doi:10.1093/bioinformatics/btaf136 |
+| [longphase](https://github.com/twolinin/longphase) | Installed with Clair3 | GPL-3.0 | not checked |
 | [minimap2](https://github.com/lh3/minimap2) | Alignment | MIT | Li, Bioinformatics 2018, doi:10.1093/bioinformatics/bty191 |
 | [samtools, bcftools](https://github.com/samtools) | BAM and VCF tools | MIT (from a citation abstract) | Danecek et al., GigaScience 2021, doi:10.1093/gigascience/giab008 |
-| [VEP](https://www.ensembl.org/info/docs/tools/vep/) | Consequence annotation | not verified | McLaren et al., Genome Biol 2016, doi:10.1186/s13059-016-0974-4 |
+| [VEP](https://www.ensembl.org/info/docs/tools/vep/) | Consequence annotation | Apache-2.0 | McLaren et al., Genome Biol 2016, doi:10.1186/s13059-016-0974-4 |
 | [ANNOVAR](https://annovar.openbioinformatics.org/) | Annotation (user-supplied) | not verified; check the ANNOVAR site | Wang et al., Nucleic Acids Res 2010;38:e164 |
 | [InterVar](https://github.com/WGLab/InterVar) | ACMG-style classification (user-supplied) | Free for non-commercial use | Li and Wang, Am J Hum Genet 2017, doi:10.1016/j.ajhg.2017.01.004 |
-| BLAST+ | RCCX site design | not verified | Camacho et al., BMC Bioinformatics 2009, doi:10.1186/1471-2105-10-421 |
+| BLAST+ | RCCX site design | Public domain (NCBI) | Camacho et al., BMC Bioinformatics 2009, doi:10.1186/1471-2105-10-421 |
 
 Citation: no paper describes paralog2viewer yet. If you publish results, cite the tools above. PubMed IDs were not checked.
 
-History: v0.9.0 replaces an earlier Nextflow pipeline with this single Python tool; the old files are kept under `legacy/`.
+History: v0.9.0 replaces an earlier Nextflow pipeline with this single Python tool.
 
 ## Author
 

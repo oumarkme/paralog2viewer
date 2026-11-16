@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import collections
 import json
-import logging
 import shutil
 import tempfile
 from pathlib import Path
@@ -26,12 +25,6 @@ from pathlib import Path
 import pysam
 
 from paralog2viewer.proc import ToolError, run
-
-LOGGER = logging.getLogger("paralog2viewer")
-
-# Clair3 2.0.3 GPU flag: NOT verified, so it is left empty on purpose and no
-# flag is guessed. Fill it only after checking the Clair3 release notes.
-GPU_FLAGS: tuple[str, ...] = ()
 
 # Model directory inside the container (same as the old Nextflow pipeline).
 CLAIR3_MODEL = "/opt/models/recall"
@@ -125,7 +118,6 @@ def clair3_command(
     *,
     threads: int,
     model_path: str = CLAIR3_MODEL,
-    gpu: bool = False,
 ) -> list[str]:
     """Return the run_clair3.sh command (options as in the Nextflow version).
 
@@ -137,7 +129,6 @@ def clair3_command(
         out_dir: Clair3 output directory.
         threads: Thread count.
         model_path: Clair3 model directory.
-        gpu: Request GPU use; adds GPU_FLAGS (empty until verified).
     """
     cmd = [
         "run_clair3.sh",
@@ -158,13 +149,6 @@ def clair3_command(
         "--no_phasing_for_fa",
         "--chunk_size=250000000",
     ]
-    if gpu:
-        if not GPU_FLAGS:
-            LOGGER.warning(
-                "gpu=True but the Clair3 GPU flag is not verified "
-                "(GPU_FLAGS is empty); running without GPU options"
-            )
-        cmd.extend(GPU_FLAGS)
     return cmd
 
 
@@ -243,7 +227,6 @@ def call_clair3(
     *,
     threads: int = 4,
     model_path: str = CLAIR3_MODEL,
-    gpu: bool = False,
 ) -> Path:
     """Run Clair3 on one haplotype and write ``clair3.vcf.gz``.
 
@@ -265,7 +248,6 @@ def call_clair3(
                 scratch / "clair3",
                 threads=threads,
                 model_path=model_path,
-                gpu=gpu,
             )
         )
         target = hap_dir / "clair3.vcf.gz"
@@ -492,7 +474,6 @@ def call_haplotype(
     *,
     threads: int = 4,
     model_path: str = CLAIR3_MODEL,
-    gpu: bool = False,
 ) -> Path:
     """Call one haplotype with Clair3 and Sawfish and combine the calls.
 
@@ -500,7 +481,7 @@ def call_haplotype(
         Path of ``<hap_dir>/calls.vcf.gz``.
     """
     clair3 = call_clair3(
-        hap_dir, reference, threads=threads, model_path=model_path, gpu=gpu
+        hap_dir, reference, threads=threads, model_path=model_path
     )
     sawfish = call_sawfish(hap_dir, reference, threads=threads)
     combine_calls(hap_dir, reference, clair3_vcf=clair3, sawfish_vcf=sawfish)

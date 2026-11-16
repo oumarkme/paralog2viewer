@@ -87,6 +87,7 @@ class Env:
             "data": self.data,
             "outdir": self.out,
             "threads": 4,
+            "memory_gb": 800.0,
             "pseudogene_tsv": self.pseudo,
         }
         values.update(kwargs)
@@ -133,8 +134,8 @@ def install_fakes(monkeypatch, env: Env, *, fail_prepare: str | None = None):
             100,
         )
 
-    def fake_call(hap_dir, ref, *, threads=4, model_path="", gpu=False):
-        log("call", hap_dir.name, gpu)
+    def fake_call(hap_dir, ref, *, threads=1, model_path=""):
+        log("call", hap_dir.name, threads)
         return _touch(hap_dir / "calls.vcf.gz")
 
     def fake_merge(hap_dirs, ref, work):
@@ -210,7 +211,7 @@ def test_stale_figures_of_an_earlier_run_are_replaced(env, monkeypatch):
 
 def test_full_run_order_names_and_tmp_cleanup(env, monkeypatch):
     install_fakes(monkeypatch, env)
-    result = runner.run_pipeline(env.settings(tmp=env.tmp, gpu=True))
+    result = runner.run_pipeline(env.settings(tmp=env.tmp))
     assert result.ok and result.work_removed
     steps = env.steps()
     assert steps[0] == "split"
@@ -223,15 +224,15 @@ def test_full_run_order_names_and_tmp_cleanup(env, monkeypatch):
     for after in ("vcf", "mviewer", "figures"):
         assert steps.index(after) > steps.index("annotate")
     assert steps.index("rccx_plot") > steps.index("rccx") > steps.index("merge")
-    # gpu reached Clair3 and the per-run cache sits in the data directory.
-    assert all(line.endswith("True") for line in env.lines("call"))
+    # One thread per haplotype call; the per-run cache sits in the data dir.
+    assert all(line.endswith("1") for line in env.lines("call"))
     assert env.lines("annotate") == ["annotate annotation_cache.sqlite"]
     sample_dir = env.out / "S1"
     assert (sample_dir / "S1.paralog.vcf.gz").exists()
-    assert (sample_dir / "S1.paralog.mviewer.gz").exists()
+    assert (sample_dir / "S1.paralog.tsv.gz").exists()
     assert (sample_dir / "figures" / "geneA.jpeg").exists()
     assert (sample_dir / "figures" / "RCCX_module.jpeg").exists()
-    assert (sample_dir / "timings.tsv").exists()
+    assert not (sample_dir / "timings.tsv").exists()
     assert "female" in env.lines("mviewer")[0]
     # region_of maps each HP to its split region.
     assert json.loads(env.lines("figures")[0].split(" ", 2)[2]) == HAPS
@@ -250,7 +251,7 @@ def test_format_vcf_only_still_annotates(env, monkeypatch):
     assert "annotate" in steps and "vcf" in steps
     assert "mviewer" not in steps and "figures" not in steps
     assert "rccx" not in steps
-    assert not (env.out / "S1" / "S1.paralog.mviewer.gz").exists()
+    assert not (env.out / "S1" / "S1.paralog.tsv.gz").exists()
 
 
 def test_format_mviewer_only_and_vcf_mode(env, monkeypatch):
@@ -280,7 +281,7 @@ def test_haplotype_failure_continues_and_exits_nonzero(
     assert env.lines("merge") == ["merge 2"]
     assert env.lines("figures")[0].split(" ")[1] == "H1,H3"
     assert (env.out / "S1" / "S1.paralog.vcf.gz").exists()
-    rows = (env.out / "S1" / "timings.tsv").read_text()
+    rows = (result.work_dir / "timings.tsv").read_text()
     assert "prepare:H2\tH2\tfailed" in rows and "call:H2\tH2\tcancelled" in rows
     code = cli.main(
         [
@@ -313,7 +314,7 @@ def test_all_haplotypes_failing_is_an_error(env, monkeypatch):
     )
     with pytest.raises(runner.PipelineError, match="no haplotype produced"):
         runner.run_pipeline(env.settings())
-    assert (env.out / "S1" / "timings.tsv").exists()
+    assert Path("work/S1/timings.tsv").exists()
 
 
 def test_global_step_failure_raises(env, monkeypatch):
@@ -340,7 +341,7 @@ def test_dry_run_prints_plan_and_creates_nothing(env, monkeypatch, capsys):
         "[5]",
         "[6]",
         "S1.paralog.vcf.gz",
-        "S1.paralog.mviewer.gz",
+        "S1.paralog.tsv.gz",
         "RCCX_module.jpeg",
         "sex female",
     ):
@@ -353,7 +354,7 @@ def test_resume_skips_finished_steps(env, monkeypatch, caplog):
     install_fakes(monkeypatch, env)
     runner.run_pipeline(env.settings())
     first = env.steps()
-    first_rows = (env.out / "S1" / "timings.tsv").read_text().splitlines()
+    first_rows = Path("work/S1/timings.tsv").read_text().splitlines()
     first_split = next(r for r in first_rows if r.startswith("split\t"))
     assert "\tdone\t" in first_split
     env.log.unlink()
@@ -361,7 +362,7 @@ def test_resume_skips_finished_steps(env, monkeypatch, caplog):
         result = runner.run_pipeline(env.settings())
     assert result.ok and env.steps() == []
     assert len(first) > 8
-    rows = (env.out / "S1" / "timings.tsv").read_text()
+    rows = Path("work/S1/timings.tsv").read_text()
     resumed = next(r for r in rows.splitlines() if r.startswith("split\t"))
     assert "\tcached\t" in resumed and "skipped" not in rows
     # Stored values and finish time survive the resume.
@@ -513,3 +514,20 @@ def test_cache_falls_back_when_not_writable(tmp_path, monkeypatch, caplog):
             work / runner.CACHE_NAME
         )
     assert "not writable" in caplog.text
+
+
+def test_publish_figures_updates_existing_dir_in_place(tmp_path):
+    stage = tmp_path / "work" / "figures"
+    stage.mkdir(parents=True)
+    (stage / "geneA.jpeg").write_bytes(b"new")
+    final = tmp_path / "out" / "figures"
+    final.mkdir(parents=True)
+    (final / "geneA.jpeg").write_bytes(b"old")
+    (final / "stale.jpeg").write_bytes(b"old")
+    leftover = tmp_path / "out" / "figures.tmp"
+    leftover.mkdir()
+    (leftover / "x.jpeg").write_bytes(b"x")
+    assert runner._publish_figures(stage, final)
+    assert sorted(p.name for p in final.iterdir()) == ["geneA.jpeg"]
+    assert (final / "geneA.jpeg").read_bytes() == b"new"
+    assert not leftover.exists()

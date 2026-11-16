@@ -516,7 +516,7 @@ def write_mviewer_table(
             messages; not written into the table).
         sex: ``Female`` or ``Male`` (case-insensitive).
         out_path: Output path (gzip text), for example
-            ``{SAMPLE_ID}.paralog.mviewer.gz``.
+            ``{SAMPLE_ID}.paralog.tsv.gz``.
         header_path: Header file; the packaged 365-name header when None.
 
     Returns:

@@ -16,9 +16,10 @@ from paralog2viewer import (
     dataprep,
     rccx,
     runner,
-    scheduler,
 )
 from paralog2viewer.datalayout import DataLayout
+
+LOGGER = logging.getLogger("paralog2viewer")
 
 
 def _formats(text: str) -> tuple[str, ...]:
@@ -55,20 +56,13 @@ def _threads(text: str) -> int:
     return value
 
 
-def _cpus(text: str) -> tuple[int, ...]:
-    try:
-        return scheduler.parse_cpu_list(text)
-    except ValueError as err:
-        raise argparse.ArgumentTypeError(f"--cpus: {err}") from err
-
-
 def _memory(text: str) -> float:
     try:
         value = float(text)
     except ValueError:
         value = 0.0
     if value <= 0:
-        raise argparse.ArgumentTypeError("--max-memory-gb must be > 0")
+        raise argparse.ArgumentTypeError("--memory must be > 0")
     return value
 
 
@@ -112,9 +106,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="scratch directory; own subdirectory is created",
     )
     run.add_argument(
-        "--gpu", action="store_true", help="use a GPU where a step supports it"
-    )
-    run.add_argument(
         "--format",
         dest="formats",
         type=_formats,
@@ -130,20 +121,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--threads",
         type=_threads,
-        default=config.DEFAULT_THREADS,
-        help="CPU budget in threads (default: %(default)s)",
+        help="maximum CPU threads (default: every CPU this process may use; "
+        "pin with taskset); above that count it is clamped with a warning",
     )
     run.add_argument(
-        "--cpus",
-        type=_cpus,
-        help="pin the run to these logical CPUs, e.g. 0-19,48-67 "
-        "(default: affinity unchanged)",
-    )
-    run.add_argument(
-        "--max-memory-gb",
+        "--memory",
         type=_memory,
-        default=config.DEFAULT_MEMORY_GB,
-        help="memory budget for the task estimates (default: %(default)s)",
+        help="maximum memory in GB (default: 80%% of the available memory)",
     )
     run.add_argument(
         "--cache",
@@ -346,6 +330,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if data is None:
         parser.error(f"--data is required (or set {config.DATA_ENV_VAR})")
     reference = args.reference or DataLayout(data).reference_fasta
+    threads, clamped = config.clamp_threads(args.threads)
+    if clamped:
+        LOGGER.warning(
+            "--threads %d exceeds the %d CPUs this process may use; using %d",
+            args.threads,
+            threads,
+            threads,
+        )
     try:
         settings = config.RunSettings(
             bam=args.bam,
@@ -355,12 +347,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             sample=args.sample,
             tmp=args.tmp,
             work_dir=args.work_dir,
-            gpu=args.gpu,
             formats=args.formats,
             figures=args.figures,
-            threads=args.threads,
-            cpus=args.cpus,
-            max_memory_gb=args.max_memory_gb,
+            threads=threads,
+            memory_gb=args.memory,
             cache=args.cache,
             pseudogene_tsv=args.pseudogene_tsv,
             vcf_annotation=args.vcf_annotation,

@@ -8,9 +8,13 @@ from pathlib import Path
 DATA_ENV_VAR = "PARALOG2VIEWER_DATA"
 VALID_FORMATS = ("vcf", "mviewer")
 VCF_ANNOTATION_MODES = ("default", "full")
-# gs4 rule: stay below 50% of 96 logical CPUs and of the memory.
-DEFAULT_THREADS = 40
-DEFAULT_MEMORY_GB = 800.0
+# Share of the available memory used when --memory is not given.
+MEMORY_FRACTION = 0.8
+# cgroup limits above this are "no limit" (v1 reports a huge number).
+_NO_LIMIT_BYTES = 1 << 60
+CGROUP_V2_MEMORY = Path("/sys/fs/cgroup/memory.max")
+CGROUP_V1_MEMORY = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+PROC_MEMINFO = Path("/proc/meminfo")
 
 
 def parse_formats(text: str) -> tuple[str, ...]:
@@ -53,6 +57,76 @@ def packaged_resource(name: str) -> Path:
     return Path(__file__).parent / "resources" / name
 
 
+def default_threads() -> int:
+    """Returns the number of CPUs this process may use (its affinity)."""
+    return len(os.sched_getaffinity(0))
+
+
+def clamp_threads(requested: int | None) -> tuple[int, bool]:
+    """Resolves the thread budget against the inherited CPU affinity.
+
+    Args:
+        requested: Requested maximum threads; None means all usable CPUs.
+
+    Returns:
+        The budget and whether the request was clamped down to the affinity.
+    """
+    usable = default_threads()
+    if requested is None:
+        return usable, False
+    return min(requested, usable), requested > usable
+
+
+def _read_bytes_limit(path: Path) -> int | None:
+    """Reads a cgroup byte limit; None when absent, ``max`` or huge."""
+    try:
+        text = path.read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+    if not text.isdigit() or int(text) >= _NO_LIMIT_BYTES:
+        return None
+    return int(text)
+
+
+def _mem_available_bytes(meminfo: Path) -> int | None:
+    """Reads ``MemAvailable`` of a meminfo file in bytes."""
+    try:
+        with open(meminfo, encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def default_memory_gb(
+    cgroup_v2: Path = CGROUP_V2_MEMORY,
+    cgroup_v1: Path = CGROUP_V1_MEMORY,
+    meminfo: Path = PROC_MEMINFO,
+) -> float:
+    """Returns 80% of the memory this process can use, in GB (1e9 bytes).
+
+    The smaller of the cgroup limit (v2, else v1; ``max`` and huge values
+    are ignored) and ``MemAvailable`` is used.
+
+    Raises:
+        ValueError: If no memory limit can be determined.
+    """
+    limits = [
+        v
+        for v in (
+            _read_bytes_limit(cgroup_v2),
+            _read_bytes_limit(cgroup_v1),
+            _mem_available_bytes(meminfo),
+        )
+        if v is not None
+    ]
+    if not limits:
+        raise ValueError("cannot determine memory; pass --memory")
+    return MEMORY_FRACTION * min(limits) / 1e9
+
+
 @dataclasses.dataclass(frozen=True)
 class RunSettings:
     """Settings of one `run` invocation.
@@ -66,19 +140,16 @@ class RunSettings:
         tmp: Scratch parent; the run makes its own subdirectory in it.
         work_dir: Existing or new work directory to reuse for resuming; it
             is never deleted by the run (overrides the ``tmp`` subdirectory).
-        gpu: Let Clair3 use a GPU.
         formats: Output formats (``vcf``, ``mviewer``).
         figures: Draw figures.
-        threads: CPU budget in logical CPUs.
-        cpus: Logical CPUs to pin the run to; None leaves the mask alone.
-        max_memory_gb: Memory budget for the task estimates.
+        threads: Maximum CPU threads; None uses every CPU in the affinity.
+        memory_gb: Maximum memory in GB; None uses 80% of the available.
         cache: Annotation cache file; None uses
             ``<data>/annotation_cache.sqlite``.
         pseudogene_tsv: Pseudogene allele table; None uses the packaged table.
         vcf_annotation: ``default`` or ``full`` (more ANNOVAR fields).
         dry_run: Print the plan and exit.
         resume: Skip steps whose done-marker is valid.
-        hap_threads: Threads given to one haplotype step.
         verify_checksums: Hash every data file at the start of the run.
     """
 
@@ -89,36 +160,37 @@ class RunSettings:
     sample: str | None = None
     tmp: Path | None = None
     work_dir: Path | None = None
-    gpu: bool = False
     formats: tuple[str, ...] = VALID_FORMATS
     figures: bool = True
-    threads: int = DEFAULT_THREADS
-    cpus: tuple[int, ...] | None = None
-    max_memory_gb: float = DEFAULT_MEMORY_GB
+    threads: int | None = None
+    memory_gb: float | None = None
     cache: Path | None = None
     pseudogene_tsv: Path | None = None
     vcf_annotation: str = "default"
     dry_run: bool = False
     resume: bool = True
-    hap_threads: int = 4
     verify_checksums: bool = False
 
     def __post_init__(self) -> None:
-        """Validates numeric limits and choices.
+        """Resolves the budgets and validates choices.
+
+        ``threads`` is clamped to the inherited CPU affinity and ``memory_gb``
+        defaults to 80% of the available memory.
 
         Raises:
             ValueError: On an invalid value.
         """
-        if self.threads < 1 or self.hap_threads < 1:
+        if self.threads is not None and self.threads < 1:
             raise ValueError("threads must be >= 1")
-        if self.max_memory_gb <= 0:
-            raise ValueError("--max-memory-gb must be > 0")
+        if self.memory_gb is not None and self.memory_gb <= 0:
+            raise ValueError("--memory must be > 0")
         if self.vcf_annotation not in VCF_ANNOTATION_MODES:
             raise ValueError(
                 f"--vcf-annotation must be one of {VCF_ANNOTATION_MODES}"
             )
-        if self.cpus is not None and self.threads > len(self.cpus):
-            raise ValueError(
-                f"--threads {self.threads} exceeds the {len(self.cpus)} "
-                "CPUs of --cpus"
-            )
+        threads, _ = clamp_threads(self.threads)
+        memory = (
+            default_memory_gb() if self.memory_gb is None else self.memory_gb
+        )
+        object.__setattr__(self, "threads", threads)
+        object.__setattr__(self, "memory_gb", memory)

@@ -19,9 +19,8 @@ def test_run_defaults_both_formats_and_figures():
     )
     assert args.formats == ("vcf", "mviewer")
     assert args.figures is True
-    assert args.threads == 40
+    assert args.threads is None and args.memory is None
     assert args.resume is True and args.dry_run is False
-    assert args.cpus is None and args.max_memory_gb == 800
     assert args.vcf_annotation == "default"
 
 
@@ -62,11 +61,9 @@ def test_run_options_reach_settings(monkeypatch):
             "run",
             "--bam",
             "a.paraphase.bam",
-            "--cpus",
-            "0-3,8",
             "--threads",
-            "5",
-            "--max-memory-gb",
+            "1",
+            "--memory",
             "100",
             "--cache",
             "c.db",
@@ -76,39 +73,35 @@ def test_run_options_reach_settings(monkeypatch):
             "full",
             "--dry-run",
             "--no-resume",
-            "--gpu",
             "--tmp",
             "t",
         ]
     )
     s = seen["s"]
     assert code == 0 and str(s.data) == "/env"
-    assert s.cpus == (0, 1, 2, 3, 8) and s.threads == 5
-    assert s.max_memory_gb == 100 and str(s.cache) == "c.db"
-    assert s.vcf_annotation == "full" and s.dry_run and not s.resume and s.gpu
+    assert s.threads == 1
+    assert s.memory_gb == 100 and str(s.cache) == "c.db"
+    assert s.vcf_annotation == "full" and s.dry_run and not s.resume
 
 
-def test_threads_above_cpus_is_usage_error(capsys):
-    with pytest.raises(SystemExit) as exc:
-        cli.main(
-            [
-                "run",
-                "--bam",
-                "a.bam",
-                "--data",
-                "d",
-                "--cpus",
-                "0-1",
-                "--threads",
-                "4",
-            ]
-        )
-    assert exc.value.code == 2
-    assert "exceeds" in capsys.readouterr().err
+def test_threads_above_affinity_are_clamped_with_warning(monkeypatch, caplog):
+    seen = {}
+
+    def fake_run(settings):
+        seen["s"] = settings
+        return runner.RunResult("S", Path("o"), dry_run=True)
+
+    monkeypatch.setenv(config.DATA_ENV_VAR, "/env")
+    monkeypatch.setattr(runner, "run_pipeline", fake_run)
+    usable = config.default_threads()
+    with caplog.at_level("WARNING", logger="paralog2viewer"):
+        cli.main(["run", "--bam", "a.bam", "--threads", str(usable + 5)])
+    assert seen["s"].threads == usable
+    assert "exceeds" in caplog.text
 
 
-def test_bad_cpus_and_memory(capsys):
-    for extra in (["--cpus", "x"], ["--max-memory-gb", "0"]):
+def test_bad_threads_and_memory(capsys):
+    for extra in (["--threads", "0"], ["--memory", "0"], ["--cpus", "0-1"]):
         with pytest.raises(SystemExit) as exc:
             cli.main(["run", "--bam", "a.bam", "--data", "d", *extra])
         assert exc.value.code == 2

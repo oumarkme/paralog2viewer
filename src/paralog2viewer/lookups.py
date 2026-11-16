@@ -27,6 +27,7 @@ import gzip
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 
 import pysam
@@ -397,9 +398,12 @@ class GeneTables:
     omim: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     default_transcripts: dict[str, set[str]] = field(default_factory=dict)
 
-    @property
+    @cached_property
     def all_default_accessions(self) -> set[str]:
-        """Every default transcript accession, without version."""
+        """Every default transcript accession, without version.
+
+        Built once per table object; callers must not modify the set.
+        """
         return set().union(*self.default_transcripts.values())
 
     def gene_info(self, symbols: Iterable[str]) -> dict[str, str]:

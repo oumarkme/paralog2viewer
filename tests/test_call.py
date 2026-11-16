@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Tests for per-haplotype calling and call combination."""
 
-import logging
 import random
 import shutil
 from pathlib import Path
@@ -10,7 +9,6 @@ import pysam
 import pytest
 
 from paralog2viewer.call import (
-    GPU_FLAGS,
     clair3_command,
     combine_calls,
     filter_clair3_vcf,
@@ -71,16 +69,6 @@ def test_clair3_command_has_main_nf_options() -> None:
         "--bed_fn=r.bed", "--bam_fn=r.bam", "--ref_fn=ref.fa",
     ):  # fmt: skip
         assert option in cmd
-
-
-def test_gpu_flag_is_not_guessed(caplog: pytest.LogCaptureFixture) -> None:
-    args = (Path("r.bam"), Path("f.fa"), Path("r.bed"), "h", Path("o"))
-    base = clair3_command(*args, threads=2)
-    with caplog.at_level(logging.WARNING, logger="paralog2viewer"):
-        gpu = clair3_command(*args, threads=2, gpu=True)
-    assert GPU_FLAGS == ()
-    assert gpu == base
-    assert "GPU flag is not verified" in caplog.text
 
 
 def test_sawfish_commands_match_main_nf() -> None:

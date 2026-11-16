@@ -59,11 +59,15 @@ WORK_PREFIX = "paralog2viewer."
 CACHE_NAME = "annotation_cache.sqlite"
 PSEUDOGENE_FILE = "known_gene_pseudogene_variants.tsv"
 RCCX_KEY = "rccx"
-# Memory estimates per task in GB (rough guesses, not measurements).
+# One thread per haplotype task: Clair3 and Sawfish each use about one core
+# on these small BAMs, so the budget is spent on many haplotypes at once.
+HAP_THREADS = 1
+# Memory estimates per task in GB (call: observed peak 3-5 GB, with margin;
+# the others are rough guesses).
 MEMORY_GB = {
     "split": 4.0,
     "prepare": 4.0,
-    "call": 12.0,
+    "call": 6.0,
     "merge": 4.0,
     "annotate": 64.0,
     "output": 8.0,
@@ -260,22 +264,16 @@ def plan_lines(settings: config.RunSettings, info: Inputs) -> list[str]:
         if settings.tmp
         else Path("work") / sample
     )
-    pin = (
-        f"pinned to {len(settings.cpus)} CPUs"
-        if settings.cpus
-        else "affinity unchanged"
-    )
     lines = [
         f"sample {sample} (sex {info.sex}); {len(info.genes)} genes in JSON",
-        f"budget: {settings.threads} threads ({pin}), "
-        f"{settings.max_memory_gb:g} GB; resume "
+        f"budget: {settings.threads} threads, "
+        f"{settings.memory_gb:.0f} GB; resume "
         f"{'on' if settings.resume else 'off'}",
         f"work directory: {work}",
         "[0] check inputs: done",
         "[1] split_haplotypes (global)",
         f"[2-4] per haplotype, longest first: prepare_haplotype "
-        f"({settings.hap_threads} threads) -> call_haplotype "
-        f"(Clair3 + Sawfish, gpu={settings.gpu})",
+        f"({HAP_THREADS} thread) -> call_haplotype (Clair3 + Sawfish)",
         "[5] merge_haplotype_calls; calling BEDs checked against data regions",
         "[6] annotate_alleles (cache "
         f"{settings.cache or settings.data / CACHE_NAME})",
@@ -287,7 +285,7 @@ def plan_lines(settings: config.RunSettings, info: Inputs) -> list[str]:
         )
     if "mviewer" in settings.formats:
         lines.append(
-            f"[7] write_mviewer_table -> {out / f'{sample}.paralog.mviewer.gz'}"
+            f"[7] write_mviewer_table -> {out / f'{sample}.paralog.tsv.gz'}"
         )
     if settings.figures:
         lines.append(f"[7] plot_regions -> {out / 'figures'}/")
@@ -296,7 +294,6 @@ def plan_lines(settings: config.RunSettings, info: Inputs) -> list[str]:
                 f"[7] classify_rccx + plot_rccx_module -> "
                 f"{out / 'figures' / 'RCCX_module.jpeg'}"
             )
-    lines.append(f"timings -> {out / 'timings.tsv'}")
     return lines
 
 
@@ -427,7 +424,7 @@ def hap_tasks(
     Priority is the source BAM size so that the longest jobs start first.
     """
     reference = settings.reference
-    threads = min(settings.hap_threads, settings.threads)
+    threads = HAP_THREADS
     tasks: list[scheduler.Task] = []
     for job in jobs:
         prep_key, call_key = f"prepare:{job.hp}", f"call:{job.hp}"
@@ -455,7 +452,7 @@ def hap_tasks(
             scheduler.Task(
                 key=call_key,
                 fn=lambda deps, pk=prep_key: _call_one(
-                    deps[pk], reference, threads, settings.gpu
+                    deps[pk], reference, threads
                 ),
                 deps=[prep_key],
                 threads=threads,
@@ -473,7 +470,7 @@ def hap_tasks(
                     ]
                 ),
                 outputs=_paths_of,
-                params={"gpu": settings.gpu, "model": call.CLAIR3_MODEL},
+                params={"model": call.CLAIR3_MODEL},
                 encode=_str_or_list,
                 decode=_path_or_list,
             )
@@ -485,14 +482,11 @@ def _call_one(
     prepared: realign.PreparedHaplotype | None,
     reference: Path,
     threads: int,
-    gpu: bool,
 ) -> Path | None:
     """Calls one prepared haplotype; None if it had no reads."""
     if prepared is None:
         return None
-    return call.call_haplotype(
-        prepared.bam.parent, reference, threads=threads, gpu=gpu
-    )
+    return call.call_haplotype(prepared.bam.parent, reference, threads=threads)
 
 
 def _output_task(
@@ -551,14 +545,11 @@ def run_pipeline(settings: config.RunSettings) -> RunResult:
     old_tmpdir = os.environ.get("TMPDIR")
     try:
         with scheduler.work_lock(work):
-            cpus = scheduler.apply_affinity(settings.cpus)
-            LOGGER.info("CPU affinity: %d CPUs", len(cpus))
-            if len(cpus) < settings.threads:
-                LOGGER.warning(
-                    "threads %d exceed the %d CPUs available",
-                    settings.threads,
-                    len(cpus),
-                )
+            LOGGER.info(
+                "budget: %d threads, %.0f GB",
+                settings.threads,
+                settings.memory_gb,
+            )
             (work / "tmp").mkdir(exist_ok=True)
             os.environ["TMPDIR"] = str(work / "tmp")
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -566,15 +557,16 @@ def run_pipeline(settings: config.RunSettings) -> RunResult:
             pool = scheduler.Pool(
                 settings.threads,
                 work / "markers",
-                max_memory_gb=settings.max_memory_gb,
+                max_memory_gb=settings.memory_gb,
                 resume=settings.resume,
             )
             try:
                 _execute(settings, info, work, out_dir, pool, result)
             finally:
                 total_wall = time.monotonic() - started
+                # Kept in the work directory for profiling, not published.
                 scheduler.write_timings(
-                    out_dir / "timings.tsv", pool.timings, total_wall
+                    work / "timings.tsv", pool.timings, total_wall
                 )
                 summary = scheduler.summarize_timings(pool.timings, total_wall)
                 LOGGER.info(
@@ -670,7 +662,6 @@ def _execute(
     dir_list = list(hap_dirs.values())
 
     # [5]-[7] global graph.
-    annotate_threads = max(1, min(8, budget // 2))
     # Figures are drawn in the work directory (so a resume can reuse them),
     # copied to a sibling of ``figures/`` and swapped in after success, so
     # no figure of an earlier run survives.
@@ -709,10 +700,10 @@ def _execute(
                 layout,
                 work,
                 cache_path,
-                annotate_threads,
+                annotate.VEP_FORK,
             ),
             deps=["merge", "verify_regions"],
-            threads=min(budget, 2 * annotate_threads),
+            threads=min(budget, annotate.VEP_FORK + annotate.ANNOVAR_THREADS),
             priority=1.0,
             memory_gb=MEMORY_GB["annotate"],
             inputs=lambda deps: [deps["merge"], layout.manifest],
@@ -739,7 +730,7 @@ def _execute(
             )
         )
     if "mviewer" in settings.formats:
-        out = out_dir / f"{sample}.paralog.mviewer.gz"
+        out = out_dir / f"{sample}.paralog.tsv.gz"
 
         def write_table(deps: Mapping[str, Any], out: Path = out) -> Path:
             mviewer_table.write_mviewer_table(
@@ -758,7 +749,7 @@ def _execute(
             )
         )
     if settings.figures:
-        fig_threads = min(4, budget)
+        fig_threads = max(1, min(budget, len(set(region_of.values()))))
         pseudo = pseudogene_path(settings)
 
         def draw(deps: Mapping[str, Any]) -> list[Path]:
@@ -772,8 +763,12 @@ def _execute(
                 fig_dir,
                 workers=fig_threads,
                 region_of=region_of,
+                gene_models=gene_models,
+                default_transcripts=layout.default_transcript,
+                hap_info=info.json_path,
             )
 
+        gene_models = layout.annovar_humandb / "hg38_refGene.txt"
         tasks.append(
             _output_task(
                 "figures",
@@ -781,6 +776,7 @@ def _execute(
                 ["merge", "annotate"],
                 lambda deps: (
                     [deps["merge"], deps["annotate"], pseudo]
+                    + [gene_models, layout.default_transcript, info.json_path]
                     + [d / "reads.bam" for d in dir_list]
                 ),
                 group="figures",
@@ -842,20 +838,30 @@ def _clear_stale_figures(stage: Path) -> None:
 
 
 def _publish_figures(stage: Path, final: Path) -> bool:
-    """Replaces ``final`` by a copy of ``stage`` (copy, then swap).
+    """Makes ``final`` hold exactly the figures in ``stage``.
+
+    Each file is copied to a ``.part`` name and moved into place with
+    ``os.replace``, and figures absent from ``stage`` are removed. No
+    directory is renamed, because a directory swap fails on network file
+    systems that release a deleted directory late.
 
     Returns:
         True if the staging directory existed and was published.
     """
     if not stage.is_dir():
         return False
-    temporary = final.with_name(final.name + ".tmp")
-    if temporary.exists():
-        shutil.rmtree(temporary)
-    shutil.copytree(stage, temporary)
-    if final.exists():
-        shutil.rmtree(final)
-    temporary.rename(final)
+    legacy = final.with_name(final.name + ".tmp")
+    if legacy.is_dir():
+        shutil.rmtree(legacy)
+    final.mkdir(parents=True, exist_ok=True)
+    names = {path.name for path in stage.glob("*.jpeg")}
+    for path in final.glob("*.jpeg"):
+        if path.name not in names:
+            path.unlink()
+    for name in sorted(names):
+        part = final / f"{name}.part"
+        shutil.copyfile(stage / name, part)
+        os.replace(part, final / name)
     return True
 
 

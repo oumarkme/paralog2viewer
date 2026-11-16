@@ -184,6 +184,19 @@ SYMBOLIC_INFO_KEYS = ("END", "SVTYPE", "SVLEN", "CIPOS", "CIEND", "MATEID")
 REFSEQ_RE = re.compile(r"^(NM|NR|XM|XR)_")
 
 
+# ANNOVAR ``-thread``: measured on one sample (4,111 alleles, one run each,
+# whole step): 1 thread 49.9 s, 4 threads 52.0 s, 8 threads 69.9 s, 16
+# threads 109.3 s. More threads were slower, and the multianno table is the
+# same except the order of repeat names in the rmsk column, which varies from
+# run to run.
+ANNOVAR_THREADS = 1
+# VEP ``--fork``. Larger values (16: 37 s, 32: 35 s against 41 s for 8) do not
+# shorten the run because the ANNOVAR -> InterVar chain (about 65 s) is the
+# longer branch, and they change a few VEP rows (HGNC ids differ between fork
+# counts), so the value stays fixed whatever the budget.
+VEP_FORK = 8
+
+
 @dataclass(frozen=True)
 class ToolPaths:
     """Locations of the annotators inside the container.
@@ -917,7 +930,6 @@ def _annovar_branch(
     layout: DataLayout,
     sites: SitesVcfs,
     ann_dir: Path,
-    threads: int,
     tools: ToolPaths,
 ) -> None:
     """Run ANNOVAR then InterVar on the small-variant VCF."""
@@ -926,7 +938,7 @@ def _annovar_branch(
     env = _run_env(ann_dir)
     prefix = ann_dir / "small"
     proc.run(
-        annovar_command(layout, sites.small, prefix, threads, tools),
+        annovar_command(layout, sites.small, prefix, ANNOVAR_THREADS, tools),
         cwd=ann_dir,
         env=env,
     )
@@ -957,9 +969,7 @@ def run_annotators(
             pool.submit(
                 _vep_branch, layout, reference, sites, ann_dir, threads, tools
             ),
-            pool.submit(
-                _annovar_branch, layout, sites, ann_dir, threads, tools
-            ),
+            pool.submit(_annovar_branch, layout, sites, ann_dir, tools),
         ]
         for future in futures:
             future.result()
@@ -1017,8 +1027,7 @@ def annotate_alleles(
         data_layout: Data directory layout; its manifest keys the cache.
         work_dir: Run work directory ``W``; files go to ``W/annotation``.
         cache_path: SQLite cache file (may be shared across runs).
-        threads: Threads per annotator branch (VEP ``--fork``, ANNOVAR
-            ``-thread``).
+        threads: VEP ``--fork`` (ANNOVAR uses ``ANNOVAR_THREADS``).
         tools: Annotator locations.
 
     Returns:

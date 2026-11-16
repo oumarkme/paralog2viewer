@@ -18,4 +18,8 @@ legacy/
 *.tbi
 *.sqlite
 *.jpeg
-*.mviewer.gz
+*.paralog.tsv.gz
+docs/_site/
+docs/.jekyll-cache/
+docs/index.md
+!docs/images/*.jpeg

@@ -175,7 +175,7 @@ def test_header_resource_is_valid() -> None:
 
 def test_rows_sort_and_genotype(tmp_path: Path) -> None:
     merged, records = write_inputs(tmp_path)
-    out = tmp_path / "s.paralog.mviewer.gz"
+    out = tmp_path / "s.paralog.tsv.gz"
     n = write_mviewer_table(records, merged, "S1", "female", out)
     comment, rows = read_table(out)
     assert comment[0] == "#sex=Female"
