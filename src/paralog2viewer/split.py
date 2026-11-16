@@ -168,6 +168,35 @@ def _is_gene2(
     )
 
 
+def _native_target(
+    region: str,
+    hap: str,
+    details: dict[str, Any],
+    bam: pysam.AlignmentFile,
+    native: NativeRegions,
+) -> tuple[tuple[str, int, int, Any] | None, str]:
+    """Resolve the native (gene2) target of one haplotype.
+
+    Returns:
+        ``((chrom, start0, end0, boundary), "used")`` when the JSON has a
+        complete native boundary and a confident primary read of this
+        haplotype lies in the native region (0-based half-open); otherwise
+        ``(None, status)`` and the caller keeps the primary locus.
+    """
+    boundary = details.get("boundary_gene2")
+    if not boundary or None in boundary:
+        return None, "missing_native_boundary"
+    chrom, lo, hi = native[region]
+    for read in bam.fetch(chrom, lo - 1, hi):
+        if (
+            _is_confident(read)
+            and read.get_tag("RN") == region
+            and read.get_tag("HP") == hap
+        ):
+            return (chrom, lo - 1, hi, boundary), "used"
+    return None, "no_native_primary_reads"
+
+
 def _plan_jobs(
     data: dict[str, Any],
     bam_path: Path,
@@ -226,26 +255,11 @@ def _plan_jobs(
                 bounds = details.get("boundary")
                 status = "not_applicable"
                 if _is_gene2(region, hap, smn2, native):
-                    status = "missing_native_boundary"
-                    native_bounds = details.get("boundary_gene2")
-                    if native_bounds and None not in native_bounds:
-                        n_chrom, n_lo, n_hi = native[region]
-                        n_primary = sum(
-                            1
-                            for read in bam.fetch(n_chrom, n_lo - 1, n_hi)
-                            if _is_confident(read)
-                            and read.get_tag("RN") == region
-                            and read.get_tag("HP") == hap
-                        )
-                        status = "no_native_primary_reads"
-                        if n_primary:
-                            selected, fetch_lo, fetch_hi = (
-                                n_chrom,
-                                n_lo - 1,
-                                n_hi,
-                            )
-                            bounds = native_bounds
-                            status = "used"
+                    target, status = _native_target(
+                        region, hap, details, bam, native
+                    )
+                    if target:
+                        selected, fetch_lo, fetch_hi, bounds = target
                 if (
                     not 0
                     <= fetch_lo
@@ -277,6 +291,114 @@ def _plan_jobs(
                     }
                 )
     return jobs
+
+
+def _read_membership(
+    jobs: list[dict[str, Any]],
+    assignments: dict[tuple[str, str], set[str]],
+) -> dict[str, list[int]]:
+    """Map read ID to the indexes of the jobs that select it.
+
+    Raises:
+        ValueError: An HP value is used by two regions, or one read has
+            conflicting primary HP assignments within a region.
+    """
+    owners: dict[str, str] = {}
+    for job in jobs:
+        other = owners.setdefault(job["hap"], job["region"])
+        if other != job["region"]:
+            raise ValueError(
+                f"HP value {job['hap']} used by regions {other} and "
+                f"{job['region']}; Genotype must be unique"
+            )
+    membership: dict[str, list[int]] = collections.defaultdict(list)
+    unique: dict[tuple[str, str], str] = {}
+    for index, job in enumerate(jobs):
+        for read_id in assignments[(job["region"], job["hap"])]:
+            previous = unique.setdefault((job["region"], read_id), job["hap"])
+            if previous != job["hap"]:
+                raise ValueError(
+                    f"Conflicting primary HP assignments: "
+                    f"{job['region']}:{read_id}"
+                )
+            membership[read_id].append(index)
+    return membership
+
+
+def _extract_reads(
+    bam: Path,
+    header: dict[str, Any],
+    jobs: list[dict[str, Any]],
+    membership: dict[str, list[int]],
+    sample: str,
+    threads: int,
+) -> int:
+    """Write every job's ``source_reads.bam`` and fill its count fields.
+
+    Returns:
+        Number of records scanned in the Paraphase BAM.
+    """
+    writers: dict[int, pysam.AlignmentFile] = {}
+    primary_ids: dict[int, set[str]] = collections.defaultdict(set)
+    counts: dict[int, collections.Counter[str]] = collections.defaultdict(
+        collections.Counter
+    )
+    max_len: dict[int, int] = collections.defaultdict(int)
+    for index, job in enumerate(jobs):
+        if not job["assigned_read_ids"]:
+            continue
+        out_header = dict(header)
+        out_header["RG"] = [
+            {"ID": job["hap"], "SM": job["hap"], "PL": "ONT", "DS": sample}
+        ]
+        out_header["PG"] = list(header.get("PG", [])) + [
+            {"ID": "paralog2viewer_extract", "PN": "paralog2viewer"}
+        ]
+        writers[index] = pysam.AlignmentFile(
+            job["source_bam"], "wb", header=out_header
+        )
+    scanned = 0
+    try:
+        # Fresh handle for this second full pass: reusing the handle of the
+        # assignment scan truncates iteration on Paraphase BAMs.
+        with pysam.AlignmentFile(str(bam), "rb", threads=threads) as extract:
+            for read in extract.fetch(until_eof=True):
+                scanned += 1
+                if read.is_secondary or read.query_name not in membership:
+                    continue
+                for index in membership[read.query_name]:
+                    # A read chimeric across paralogous loci can carry several
+                    # non-supplementary records, each with the full sequence.
+                    # Keep only the first so FASTQ extraction sees it once.
+                    if (
+                        not read.is_supplementary
+                        and read.query_name in primary_ids[index]
+                    ):
+                        continue
+                    job = jobs[index]
+                    read.set_tag("HP", job["hap"], value_type="Z")
+                    read.set_tag("RN", job["region"], value_type="Z")
+                    read.set_tag("RG", job["hap"], value_type="Z")
+                    writers[index].write(read)
+                    if read.is_supplementary:
+                        counts[index]["supplementary"] += 1
+                    else:
+                        counts[index]["primary"] += 1
+                        primary_ids[index].add(read.query_name)
+                        max_len[index] = max(
+                            max_len[index], read.query_length or 0
+                        )
+    finally:
+        for writer in writers.values():
+            writer.close()
+    for index, job in enumerate(jobs):
+        job["primary_records"] = counts[index]["primary"]
+        job["supplementary_records"] = counts[index]["supplementary"]
+        job["matched_primary_read_ids"] = len(primary_ids[index])
+        job["max_read_length"] = max_len[index]
+        ready = bool(primary_ids[index] and max_len[index])
+        job["status"] = "ready" if ready else "no_matching_primary"
+    return scanned
 
 
 def split_haplotypes(
@@ -348,90 +470,15 @@ def split_haplotypes(
             data, bam, ref, assignments, native, audit, work_dir, sample
         )
     audit["haplotypes"] = jobs
-    owners: dict[str, str] = {}
-    for job in jobs:
-        other = owners.setdefault(job["hap"], job["region"])
-        if other != job["region"]:
-            raise ValueError(
-                f"HP value {job['hap']} used by regions {other} and "
-                f"{job['region']}; Genotype must be unique"
-            )
-    membership: dict[str, list[int]] = collections.defaultdict(list)
-    unique: dict[tuple[str, str], str] = {}
-    for index, job in enumerate(jobs):
-        for read_id in assignments[(job["region"], job["hap"])]:
-            previous = unique.setdefault((job["region"], read_id), job["hap"])
-            if previous != job["hap"]:
-                raise ValueError(
-                    f"Conflicting primary HP assignments: "
-                    f"{job['region']}:{read_id}"
-                )
-            membership[read_id].append(index)
-    writers: dict[int, pysam.AlignmentFile] = {}
-    primary_ids: dict[int, set[str]] = collections.defaultdict(set)
-    counts: dict[int, collections.Counter[str]] = collections.defaultdict(
-        collections.Counter
+    membership = _read_membership(jobs, assignments)
+    audit["paraphase_bam_records_scanned"] = _extract_reads(
+        bam, header, jobs, membership, sample, threads
     )
-    max_len: dict[int, int] = collections.defaultdict(int)
-    for index, job in enumerate(jobs):
-        if not job["assigned_read_ids"]:
-            continue
-        out_header = dict(header)
-        out_header["RG"] = [
-            {"ID": job["hap"], "SM": job["hap"], "PL": "ONT", "DS": sample}
-        ]
-        out_header["PG"] = list(header.get("PG", [])) + [
-            {"ID": "paralog2viewer_extract", "PN": "paralog2viewer"}
-        ]
-        writers[index] = pysam.AlignmentFile(
-            job["source_bam"], "wb", header=out_header
-        )
-    scanned = 0
-    try:
-        # Fresh handle for this second full pass: reusing the handle of the
-        # assignment scan truncates iteration on Paraphase BAMs.
-        with pysam.AlignmentFile(str(bam), "rb", threads=threads) as extract:
-            for read in extract.fetch(until_eof=True):
-                scanned += 1
-                if read.is_secondary or read.query_name not in membership:
-                    continue
-                for index in membership[read.query_name]:
-                    # A read chimeric across paralogous loci can carry several
-                    # non-supplementary records, each with the full sequence.
-                    # Keep only the first so FASTQ extraction sees it once.
-                    if (
-                        not read.is_supplementary
-                        and read.query_name in primary_ids[index]
-                    ):
-                        continue
-                    job = jobs[index]
-                    read.set_tag("HP", job["hap"], value_type="Z")
-                    read.set_tag("RN", job["region"], value_type="Z")
-                    read.set_tag("RG", job["hap"], value_type="Z")
-                    writers[index].write(read)
-                    if read.is_supplementary:
-                        counts[index]["supplementary"] += 1
-                    else:
-                        counts[index]["primary"] += 1
-                        primary_ids[index].add(read.query_name)
-                        max_len[index] = max(
-                            max_len[index], read.query_length or 0
-                        )
-    finally:
-        for writer in writers.values():
-            writer.close()
-    audit["paraphase_bam_records_scanned"] = scanned
     ready: list[HaplotypeJob] = []
-    for index, job in enumerate(jobs):
-        job["primary_records"] = counts[index]["primary"]
-        job["supplementary_records"] = counts[index]["supplementary"]
-        job["matched_primary_read_ids"] = len(primary_ids[index])
-        job["max_read_length"] = max_len[index]
-        is_ready = bool(primary_ids[index] and max_len[index])
-        job["status"] = "ready" if is_ready else "no_matching_primary"
+    for job in jobs:
         if job["assigned_read_ids"]:
             pysam.quickcheck(job["source_bam"])
-        if is_ready:
+        if job["status"] == "ready":
             ready.append(
                 HaplotypeJob(
                     region=job["region"],

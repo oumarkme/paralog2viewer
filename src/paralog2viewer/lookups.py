@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import gzip
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
@@ -138,11 +138,19 @@ def minimal_allele(pos: int, ref: str, alt: str) -> tuple[int, str, str]:
     return pos + shift, ref, alt
 
 
-def _candidate_contigs(chrom: str) -> list[str]:
-    """Return contig spellings to try for ``chrom`` (with/without chr)."""
+def _fetch_first(fetch: Callable, chrom: str, start: int, end: int) -> list:
+    """Return the rows of the first contig spelling the file knows.
+
+    Tries ``chrom`` as given, without and with ``chr``; a spelling absent from
+    the index raises ValueError and the next one is tried.
+    """
     bare = bare_chrom(chrom)
-    names = [chrom, bare, f"chr{bare}"]
-    return list(dict.fromkeys(names))
+    for contig in dict.fromkeys((chrom, bare, f"chr{bare}")):
+        try:
+            return list(fetch(contig, start, end))
+        except ValueError:
+            continue
+    return []
 
 
 def _find_columns(
@@ -222,32 +230,24 @@ class VariantTable:
         """
         target = minimal_allele(pos, ref, alt)
         window = (max(0, pos - 2), pos + len(ref) + 2)
+        index = self._index
+        keep = [
+            (name, idx)
+            for name, idx in index.items()
+            if name not in ("ref", "alt", "assembly")
+        ]
         rows: list[dict[str, str]] = []
-        for contig in _candidate_contigs(chrom):
-            try:
-                lines = list(self._tabix.fetch(contig, *window))
-            except ValueError:
+        for line in _fetch_first(self._tabix.fetch, chrom, *window):
+            cells = line.split("\t")
+            if "assembly" in index and (
+                cells[index["assembly"]].strip().lower() not in GRCH38_NAMES
+            ):
                 continue
-            for line in lines:
-                cells = line.split("\t")
-                if "assembly" in self._index and (
-                    cells[self._index["assembly"]].strip().lower()
-                    not in GRCH38_NAMES
-                ):
-                    continue
-                row_pos = int(cells[1])
-                row_ref = cells[self._index["ref"]]
-                row_alt = cells[self._index["alt"]]
-                if minimal_allele(row_pos, row_ref, row_alt) != target:
-                    continue
-                rows.append(
-                    {
-                        name: cells[idx]
-                        for name, idx in self._index.items()
-                        if name not in ("ref", "alt", "assembly")
-                    }
-                )
-            break
+            row_alleles = minimal_allele(
+                int(cells[1]), cells[index["ref"]], cells[index["alt"]]
+            )
+            if row_alleles == target:
+                rows.append({name: cells[idx] for name, idx in keep})
         return rows
 
 
@@ -300,25 +300,16 @@ class AlleleFreqTable:
             The frequency, the whole ``Freq.`` text, or ``""`` without a row.
         """
         ref, alt = ref.upper(), alt.upper()
-        for contig in _candidate_contigs(chrom):
-            try:
-                lines = list(self._tabix.fetch(contig, pos - 1, pos))
-            except ValueError:
+        for line in _fetch_first(self._tabix.fetch, chrom, pos - 1, pos):
+            cells = line.split("\t")
+            if int(cells[1]) != pos or cells[self._index["ref"]].upper() != ref:
                 continue
-            for line in lines:
-                cells = line.split("\t")
-                if (
-                    int(cells[1]) != pos
-                    or cells[self._index["ref"]].upper() != ref
-                ):
-                    continue
-                text = cells[self._index["freqs"]]
-                for pair in text.split():
-                    allele, _, freq = pair.rpartition(":")
-                    if allele.upper() == alt:
-                        return f"{float(freq):.5f}"
-                return text
-            break
+            text = cells[self._index["freqs"]]
+            for pair in text.split():
+                allele, _, freq = pair.rpartition(":")
+                if allele.upper() == alt:
+                    return f"{float(freq):.5f}"
+            return text
         return ""
 
 
@@ -593,21 +584,14 @@ class LookupTables:
         Matching is on position and alleles after minimal normalisation.
         """
         target = minimal_allele(pos, ref, alt)
-        for contig in _candidate_contigs(chrom):
-            try:
-                records = list(
-                    self.hgmd.fetch(contig, max(0, pos - 2), pos + len(ref) + 2)
-                )
-            except ValueError:
-                continue
-            for rec in records:
-                for rec_alt in rec.alts or ():
-                    if minimal_allele(rec.pos, rec.ref, rec_alt) == target:
-                        value = rec.info.get(HGMD_CLASS_KEY, "")
-                        if isinstance(value, tuple):
-                            value = ",".join(str(v) for v in value)
-                        return str(value)
-            break
+        window = (max(0, pos - 2), pos + len(ref) + 2)
+        for rec in _fetch_first(self.hgmd.fetch, chrom, *window):
+            for rec_alt in rec.alts or ():
+                if minimal_allele(rec.pos, rec.ref, rec_alt) == target:
+                    value = rec.info.get(HGMD_CLASS_KEY, "")
+                    if isinstance(value, tuple):
+                        value = ",".join(str(v) for v in value)
+                    return str(value)
         return ""
 
     def variant_fields(

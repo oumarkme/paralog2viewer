@@ -153,6 +153,13 @@ class HapReads:
 # ---------------------------------------------------------------- inputs
 
 
+def _read_tsv(path: Path | str) -> list[dict[str, str]]:
+    """Read a tab-separated file with a header, skipping ``#`` lines."""
+    with open(path, newline="", encoding="utf-8") as handle:
+        lines = (ln for ln in handle if not ln.startswith("#"))
+        return list(csv.DictReader(lines, delimiter="\t"))
+
+
 def read_known(path: Path | str) -> list[Allele]:
     """Read pseudogene-type alleles from known_gene_pseudogene_variants.tsv.
 
@@ -163,24 +170,19 @@ def read_known(path: Path | str) -> list[Allele]:
     Returns:
         One Allele per row, with ``haps`` empty (set per locus later).
     """
-    known = []
-    with open(path, newline="", encoding="utf-8") as handle:
-        lines = (ln for ln in handle if not ln.startswith("#"))
-        for row in csv.DictReader(lines, delimiter="\t"):
-            pos = int(row["pos"])
-            known.append(
-                Allele(
-                    row["chrom"],
-                    pos,
-                    pos,
-                    row["ref"],
-                    row["alt"],
-                    False,
-                    frozenset(),
-                    label=row["label"],
-                )
-            )
-    return known
+    return [
+        Allele(
+            row["chrom"],
+            int(row["pos"]),
+            int(row["pos"]),
+            row["ref"],
+            row["alt"],
+            False,
+            frozenset(),
+            label=row["label"],
+        )
+        for row in _read_tsv(path)
+    ]
 
 
 def read_alleles(
@@ -259,13 +261,16 @@ def load_reads(bam_path: Path | str) -> HapReads:
         group = [a for a in group if a.reference_name == chrom]
         if group:
             rows.append(group)
-    rows.sort(
-        key=lambda g: (
-            min(a.reference_start for a in g),
-            max(a.reference_end for a in g),
-        )
-    )
+    rows.sort(key=_bounds)
     return HapReads(rows, chrom)
+
+
+def _bounds(group: Sequence[pysam.AlignedSegment]) -> tuple[int, int]:
+    """Return the 0-based half-open span of all alignments of one read."""
+    return (
+        min(a.reference_start for a in group),
+        max(a.reference_end for a in group),
+    )
 
 
 def span(reads: HapReads) -> tuple[int, int]:
@@ -274,10 +279,7 @@ def span(reads: HapReads) -> tuple[int, int]:
     Reads shorter than ``STUB_FRACTION`` of the median read span do not
     widen the span (they stay drawn where they fall inside it).
     """
-    bounds = [
-        (min(a.reference_start for a in g), max(a.reference_end for a in g))
-        for g in reads.rows
-    ]
+    bounds = [_bounds(g) for g in reads.rows]
     lengths = sorted(e - s for s, e in bounds)
     floor = STUB_FRACTION * lengths[len(lengths) // 2]
     kept = [b for b in bounds if b[1] - b[0] >= floor] or bounds
@@ -481,13 +483,11 @@ def load_roles(
     """
     path = Path(path) if path else RESOURCES / "haplotype_roles.tsv"
     table = {}
-    with open(path, newline="", encoding="utf-8") as handle:
-        lines = (ln for ln in handle if not ln.startswith("#"))
-        for row in csv.DictReader(lines, delimiter="\t"):
-            if row["role"] not in ROLE_ORDER:
-                raise ValueError(f"unknown role {row['role']!r} in {path}")
-            key = (row["region"].lower(), row["prefix"].lower())
-            table[key] = HapRole(row["symbol"], row["role"])
+    for row in _read_tsv(path):
+        if row["role"] not in ROLE_ORDER:
+            raise ValueError(f"unknown role {row['role']!r} in {path}")
+        key = (row["region"].lower(), row["prefix"].lower())
+        table[key] = HapRole(row["symbol"], row["role"])
     return table
 
 
@@ -747,8 +747,7 @@ def read_hits(
     Returns:
         The alleles whose ALT the read carries (SV: supports).
     """
-    lo = min(a.reference_start for a in alignments)
-    hi = max(a.reference_end for a in alignments)
+    lo, hi = _bounds(alignments)
     maps: dict[int, dict[int, int]] = {}
     hits = []
     first = bisect.bisect_right(positions, lo)
@@ -907,6 +906,228 @@ def _draw_transcript(
         )
 
 
+def _legend_handles(
+    text_of: Mapping[str, str],
+    discr: Sequence[Allele],
+    plp: Sequence[Allele],
+    known_here: Sequence[Allele],
+    n_plain: int,
+) -> list:
+    """Return the legend entries of a figure, in drawing order."""
+    handles = [
+        Line2D(
+            [],
+            [],
+            ls="",
+            marker="|",
+            markersize=7,
+            markeredgewidth=1.2,
+            color=color,
+            label=text,
+        )
+        for color, text in text_of.items()
+    ]
+    if any(v.symbolic for v in discr):
+        handles.append(
+            _marker("v", 3.5, "white", "black", 0.4, "structural allele")
+        )
+    if plp:
+        handles.append(
+            _marker(
+                "D", 3.2, "white", "black", 0.6, "P/LP (ClinVar or InterVar)"
+            )
+        )
+    if known_here:
+        handles.append(
+            _marker("s", 3.0, "black", "white", 0.3, "pseudogene-type site")
+        )
+    handles.append(
+        Patch(
+            facecolor=tint(ROLE_COLOR["unresolved"], 0.6),
+            label="read depth (in the band color)",
+        )
+    )
+    if n_plain:
+        handles.append(
+            Line2D(
+                [], [], ls="", label=f"{n_plain} more named sites not lettered"
+            )
+        )
+    return handles
+
+
+def _at_x(pos: int) -> float:
+    """Plot x of a 1-based VCF position (centre of the base)."""
+    return pos - 0.5
+
+
+def _draw_allele_track(
+    ax_v: Axes,
+    x_lo: int,
+    x_hi: int,
+    relevant: Sequence[Allele],
+    known_ids: set[int],
+    color_of: Mapping[int, str],
+    plp: Sequence[Allele],
+    known_here: Sequence[Allele],
+    lettered: Sequence[Allele],
+    quiet: bool,
+) -> None:
+    """Draw ticks, SV bars, P/LP and known markers, and site letters.
+
+    ``quiet`` adds the note that no allele separates the haplotypes.
+    """
+    ax_v.set_xlim(x_lo, x_hi)
+    ax_v.set_ylim(0, VAR_MM)
+    ax_v.axis("off")
+    ax_v.axhline(0.15, lw=0.4, color=LINE_COLOR)
+    ticks = collections.defaultdict(list)
+    bars = collections.defaultdict(list)
+    for v in relevant:
+        if id(v) in known_ids:
+            continue
+        color = color_of.get(id(v), GRAY_TICK)
+        ticks[color].append([(_at_x(v.pos), 0.4), (_at_x(v.pos), 4.4)])
+        if v.symbolic and v.end > v.pos:
+            bars[color].append([(_at_x(v.pos), 2.4), (_at_x(v.end), 2.4)])
+    for color, segs in ticks.items():
+        ax_v.add_collection(LineCollection(segs, colors=color, linewidths=0.4))
+    for color, segs in bars.items():
+        ax_v.add_collection(LineCollection(segs, colors=color, linewidths=1.6))
+    plp_x = [_at_x(v.pos) for v in plp]
+    known_x = [_at_x(v.pos) for v in known_here]
+    marker_y = 5.7
+    if plp_x:
+        ax_v.scatter(
+            plp_x,
+            [marker_y] * len(plp_x),
+            s=3.2**2,
+            marker="D",
+            c="white",
+            edgecolors="black",
+            linewidths=0.5,
+            zorder=5,
+        )
+    if known_x:
+        ax_v.scatter(
+            known_x,
+            [marker_y] * len(known_x),
+            s=3.0**2,
+            marker="s",
+            c="black",
+            edgecolors="white",
+            linewidths=0.3,
+            zorder=5,
+        )
+    for letter, v in zip(string.ascii_uppercase, lettered, strict=False):
+        ax_v.text(
+            _at_x(v.pos),
+            marker_y + 1.5,
+            letter,
+            ha="center",
+            va="bottom",
+            fontsize=FONT_PT,
+        )
+    if quiet:
+        ax_v.text(
+            0.5,
+            0.2,
+            "no allele differs between the haplotypes shown",
+            transform=ax_v.transAxes,
+            ha="center",
+            va="center",
+            fontsize=FONT_PT,
+            color=LINE_COLOR,
+        )
+
+
+def _draw_reads(
+    ax_r: Axes,
+    chosen: Sequence[Sequence[pysam.AlignedSegment]],
+    row_of: Sequence[int],
+    carriers: Sequence[Allele],
+    positions: Sequence[int],
+    sep_ids: set[int],
+    known_ids: set[int],
+    color_of: Mapping[int, str],
+    pitch_pt: float,
+    guides: Sequence[float],
+) -> None:
+    """Draw read lines, allele ticks, SV, known and P/LP marks, guides."""
+    segs, tick_at = [], collections.defaultdict(list)
+    plp_xy: tuple[list, list] = ([], [])
+    known_xy: tuple[list, list] = ([], [])
+    sv_xy = collections.defaultdict(lambda: ([], []))
+    for g, row in zip(chosen, row_of, strict=True):
+        segs += [[(a.reference_start, row), (a.reference_end, row)] for a in g]
+        for v in read_hits(g, carriers, positions):
+            x = _at_x(v.pos)
+            if id(v) in known_ids:
+                known_xy[0].append(x)
+                known_xy[1].append(row)
+                continue
+            if id(v) in sep_ids:
+                if v.symbolic:
+                    sv_xy[color_of[id(v)]][0].append(x)
+                    sv_xy[color_of[id(v)]][1].append(row)
+                else:
+                    tick_at[color_of[id(v)]].append(
+                        [(x, row - 0.45), (x, row + 0.45)]
+                    )
+            if v.plp:
+                plp_xy[0].append(x)
+                plp_xy[1].append(row)
+    ax_r.add_collection(
+        LineCollection(
+            segs,
+            colors=READ_COLOR,
+            linewidths=min(1.8, max(0.45, 0.5 * pitch_pt)),
+            zorder=2,
+            capstyle="butt",
+        )
+    )
+    for tick_color, tick_segs in tick_at.items():
+        ax_r.add_collection(
+            LineCollection(
+                tick_segs, colors=tick_color, linewidths=0.6, zorder=3
+            )
+        )
+    mark_pt = min(3.6, max(2.4, 1.7 * pitch_pt))
+    for tick_color, (xs, ys) in sv_xy.items():
+        ax_r.scatter(
+            xs,
+            ys,
+            s=mark_pt**2,
+            marker="v",
+            c=tick_color,
+            edgecolors="black",
+            linewidths=0.25,
+            zorder=4,
+        )
+    if known_xy[0]:
+        ax_r.scatter(
+            *known_xy,
+            s=mark_pt**2,
+            marker="s",
+            c="black",
+            edgecolors="white",
+            linewidths=0.3,
+            zorder=6,
+        )
+    if plp_xy[0]:
+        ax_r.scatter(
+            *plp_xy,
+            s=(1.1 * mark_pt) ** 2,
+            marker="D",
+            c="white",
+            edgecolors="black",
+            linewidths=0.45,
+            zorder=5,
+        )
+    for g in guides:
+        ax_r.axvline(g, lw=0.3, ls=(0, (1.5, 1.5)), color=GUIDE_COLOR, zorder=1)
+
+
 def _short_name(hap: str) -> str:
     """HP name without its region prefix (``pms2_pms2hap1`` -> ``pms2hap1``)."""
     return hap.rsplit("_", 1)[-1]
@@ -1031,45 +1252,7 @@ def draw_locus(
     n_plain = len(named) - len(lettered)
     key_mm = KEY_ROW_MM * math.ceil(len(lettered) / 3) + 1 if lettered else 0.0
 
-    handles = [
-        Line2D(
-            [],
-            [],
-            ls="",
-            marker="|",
-            markersize=7,
-            markeredgewidth=1.2,
-            color=color,
-            label=text,
-        )
-        for color, text in text_of.items()
-    ]
-    if any(v.symbolic for v in discr):
-        handles.append(
-            _marker("v", 3.5, "white", "black", 0.4, "structural allele")
-        )
-    if plp:
-        handles.append(
-            _marker(
-                "D", 3.2, "white", "black", 0.6, "P/LP (ClinVar or InterVar)"
-            )
-        )
-    if known_here:
-        handles.append(
-            _marker("s", 3.0, "black", "white", 0.3, "pseudogene-type site")
-        )
-    handles.append(
-        Patch(
-            facecolor=tint(ROLE_COLOR["unresolved"], 0.6),
-            label="read depth (in the band color)",
-        )
-    )
-    if n_plain:
-        handles.append(
-            Line2D(
-                [], [], ls="", label=f"{n_plain} more named sites not lettered"
-            )
-        )
+    handles = _legend_handles(text_of, discr, plp, known_here, n_plain)
     chars = sum(len(h.get_label()) + 5 for h in handles)
     legend_rows = 1 if chars * CHAR_MM <= WIDTH_MM - 6 else 2
     legend_mm = LEGEND_ROW_MM * legend_rows + 1
@@ -1093,11 +1276,7 @@ def draw_locus(
     plan = {}
     for h in names:
         chosen = sample_reads(reads[h].rows, max_reads, h)
-        spans = [
-            (min(a.reference_start for a in g), max(a.reference_end for a in g))
-            for g in chosen
-        ]
-        row_of = pack_rows(spans)
+        row_of = pack_rows([_bounds(g) for g in chosen])
         plan[h] = (chosen, row_of, max(row_of, default=0) + 1)
     # A band is as tall as its packed rows need, then all shrink together
     # if the figure would pass the height limit.
@@ -1125,10 +1304,6 @@ def draw_locus(
 
     def text_at(x: float, y: float, s: str, **kw: object) -> None:
         fig.text(x / WIDTH_MM, 1 - y / height_mm, s, fontsize=FONT_PT, **kw)
-
-    def at_x(x: float) -> float:
-        """Plot x of a 1-based VCF position (centre of the base)."""
-        return x - 0.5
 
     y = TOP_MM
     if subtitle:
@@ -1165,73 +1340,20 @@ def draw_locus(
     # Allele track: one tick per allele that separates haplotypes.
     if show_vars:
         ax_v = axes_at(y, VAR_MM)
-        ax_v.set_xlim(x_lo, x_hi)
-        ax_v.set_ylim(0, VAR_MM)
-        ax_v.axis("off")
-        ax_v.axhline(0.15, lw=0.4, color=LINE_COLOR)
-        ticks = collections.defaultdict(list)
-        bars = collections.defaultdict(list)
-        for v in relevant:
-            if id(v) in known_ids:
-                continue
-            color = color_of.get(id(v), GRAY_TICK)
-            ticks[color].append([(at_x(v.pos), 0.4), (at_x(v.pos), 4.4)])
-            if v.symbolic and v.end > v.pos:
-                bars[color].append([(at_x(v.pos), 2.4), (at_x(v.end), 2.4)])
-        for color, segs in ticks.items():
-            ax_v.add_collection(
-                LineCollection(segs, colors=color, linewidths=0.4)
-            )
-        for color, segs in bars.items():
-            ax_v.add_collection(
-                LineCollection(segs, colors=color, linewidths=1.6)
-            )
-        plp_x = [at_x(v.pos) for v in plp]
-        known_x = [at_x(v.pos) for v in known_here]
-        marker_y = 5.7
-        if plp_x:
-            ax_v.scatter(
-                plp_x,
-                [marker_y] * len(plp_x),
-                s=3.2**2,
-                marker="D",
-                c="white",
-                edgecolors="black",
-                linewidths=0.5,
-                zorder=5,
-            )
-        if known_x:
-            ax_v.scatter(
-                known_x,
-                [marker_y] * len(known_x),
-                s=3.0**2,
-                marker="s",
-                c="black",
-                edgecolors="white",
-                linewidths=0.3,
-                zorder=5,
-            )
-        for letter, v in zip(string.ascii_uppercase, lettered, strict=False):
-            ax_v.text(
-                at_x(v.pos),
-                marker_y + 1.5,
-                letter,
-                ha="center",
-                va="bottom",
-                fontsize=FONT_PT,
-            )
-        if n_hap > 1 and not discr:
-            ax_v.text(
-                0.5,
-                0.2,
-                "no allele differs between the haplotypes shown",
-                transform=ax_v.transAxes,
-                ha="center",
-                va="center",
-                fontsize=FONT_PT,
-                color=LINE_COLOR,
-            )
-        else:
+        quiet = n_hap > 1 and not discr
+        _draw_allele_track(
+            ax_v,
+            x_lo,
+            x_hi,
+            relevant,
+            known_ids,
+            color_of,
+            plp,
+            known_here,
+            lettered,
+            quiet,
+        )
+        if not quiet:
             text_at(
                 left_mm - 1.5,
                 y + VAR_MM / 2,
@@ -1245,7 +1367,7 @@ def draw_locus(
     y += var_mm
 
     # One band per haplotype.
-    guides = [at_x(v.pos) for v in lettered]
+    guides = [_at_x(v.pos) for v in lettered]
     for index, hap in enumerate(names):
         hr, role = reads[hap], roles[hap]
         color = hap_color[hap]
@@ -1285,82 +1407,18 @@ def draw_locus(
 
         carriers = [v for v in relevant if hap in v.haps]
         positions = [v.pos for v in carriers]
-        segs, tick_at = [], collections.defaultdict(list)
-        plp_xy: tuple[list, list] = ([], [])
-        known_xy: tuple[list, list] = ([], [])
-        sv_xy = collections.defaultdict(lambda: ([], []))
-        for g, row in zip(chosen, row_of, strict=True):
-            segs += [
-                [(a.reference_start, row), (a.reference_end, row)] for a in g
-            ]
-            for v in read_hits(g, carriers, positions):
-                x = at_x(v.pos)
-                if id(v) in known_ids:
-                    known_xy[0].append(x)
-                    known_xy[1].append(row)
-                    continue
-                if id(v) in sep_ids:
-                    if v.symbolic:
-                        sv_xy[color_of[id(v)]][0].append(x)
-                        sv_xy[color_of[id(v)]][1].append(row)
-                    else:
-                        tick_at[color_of[id(v)]].append(
-                            [(x, row - 0.45), (x, row + 0.45)]
-                        )
-                if v.plp:
-                    plp_xy[0].append(x)
-                    plp_xy[1].append(row)
-        ax_r.add_collection(
-            LineCollection(
-                segs,
-                colors=READ_COLOR,
-                linewidths=min(1.8, max(0.45, 0.5 * pitch_pt)),
-                zorder=2,
-                capstyle="butt",
-            )
+        _draw_reads(
+            ax_r,
+            chosen,
+            row_of,
+            carriers,
+            positions,
+            sep_ids,
+            known_ids,
+            color_of,
+            pitch_pt,
+            guides,
         )
-        for tick_color, tick_segs in tick_at.items():
-            ax_r.add_collection(
-                LineCollection(
-                    tick_segs, colors=tick_color, linewidths=0.6, zorder=3
-                )
-            )
-        mark_pt = min(3.6, max(2.4, 1.7 * pitch_pt))
-        for tick_color, (xs, ys) in sv_xy.items():
-            ax_r.scatter(
-                xs,
-                ys,
-                s=mark_pt**2,
-                marker="v",
-                c=tick_color,
-                edgecolors="black",
-                linewidths=0.25,
-                zorder=4,
-            )
-        if known_xy[0]:
-            ax_r.scatter(
-                *known_xy,
-                s=mark_pt**2,
-                marker="s",
-                c="black",
-                edgecolors="white",
-                linewidths=0.3,
-                zorder=6,
-            )
-        if plp_xy[0]:
-            ax_r.scatter(
-                *plp_xy,
-                s=(1.1 * mark_pt) ** 2,
-                marker="D",
-                c="white",
-                edgecolors="black",
-                linewidths=0.45,
-                zorder=5,
-            )
-        for g in guides:
-            ax_r.axvline(
-                g, lw=0.3, ls=(0, (1.5, 1.5)), color=GUIDE_COLOR, zorder=1
-            )
 
         # Left label with the role strip.
         fig.add_artist(

@@ -363,6 +363,20 @@ class _Running:
     task_hash: str
 
 
+@dataclasses.dataclass
+class _State:
+    """Mutable state of one :meth:`Pool.run` call."""
+
+    pending: dict[str, Task]
+    report: Report = dataclasses.field(default_factory=Report)
+    hashes: dict[str, str] = dataclasses.field(default_factory=dict)
+    queued: dict[str, str] = dataclasses.field(default_factory=dict)
+    running: dict[str, _Running] = dataclasses.field(default_factory=dict)
+    used_threads: int = 0
+    used_mem: float = 0.0
+    fatal: tuple[str, str] | None = None
+
+
 class Pool:
     """Runs task graphs under a thread and memory budget.
 
@@ -519,191 +533,200 @@ class Pool:
             GlobalStepError: If a task without a group failed. Running
                 workers are terminated first.
         """
-        by_key = self._validate(tasks)
-        report = Report()
-        hashes: dict[str, str] = {}
-        pending = dict(by_key)
-        running: dict[str, _Running] = {}
-        used_threads = 0
-        used_mem = 0.0
-        fatal: tuple[str, str] | None = None
-
-        def fail(task: Task, message: str, wall: float = 0.0) -> None:
-            report.failures[task.key] = message
-            self.timings.append(
-                Timing(task.key, task.group or "", "failed", task.threads, wall)
-            )
-            LOGGER.error("%s failed: %s", task.key, message)
-
+        state = _State(pending=dict(self._validate(tasks)))
         previous = self._install_signal_handlers()
         try:
-            while pending or running:
-                progressed = False
-                # Cancel tasks whose dependency failed or was cancelled.
-                for key in list(pending):
-                    task = pending[key]
-                    bad = [d for d in task.deps if d in report.failures]
-                    if bad:
-                        del pending[key]
-                        report.failures[key] = f"cancelled: {bad[0]} failed"
-                        self.timings.append(
-                            Timing(
-                                key, task.group or "", "cancelled", task.threads
-                            )
-                        )
-                        progressed = True
-                if fatal is None:
-                    ready = sorted(
-                        (
-                            t
-                            for t in pending.values()
-                            if all(d in report.results for d in t.deps)
-                        ),
-                        key=lambda t: (-t.priority, t.key),
-                    )
-                    for task in ready:
-                        dep_results = {d: report.results[d] for d in task.deps}
-                        try:
-                            task_hash = self._task_hash(
-                                task,
-                                dep_results,
-                                [hashes[d] for d in task.deps],
-                            )
-                        except Exception as err:  # noqa: BLE001
-                            del pending[task.key]
-                            fail(task, f"hashing inputs: {err}")
-                            progressed = True
-                            if task.group is None:
-                                fatal = (task.key, report.failures[task.key])
-                                break
-                            continue
-                        hit, result, stored = self._try_resume(task, task_hash)
-                        if hit:
-                            del pending[task.key]
-                            hashes[task.key] = task_hash
-                            report.results[task.key] = result
-                            report.skipped.append(task.key)
-                            self.timings.append(
-                                Timing(
-                                    task.key,
-                                    task.group or "",
-                                    "cached",
-                                    task.threads,
-                                    *_stored_usage(stored),
-                                )
-                            )
-                            progressed = True
-                            continue
-                        if (
-                            used_threads + task.threads > self.threads
-                            or used_mem + task.memory_gb > self.max_memory_gb
-                        ):
-                            continue
-                        self.marker_path(task.key).unlink(missing_ok=True)
-                        parent, child = self._ctx.Pipe(duplex=False)
-                        proc = self._ctx.Process(
-                            target=_worker,
-                            args=(child, task.fn, dep_results),
-                            name=task.key,
-                        )
-                        proc.start()
-                        child.close()
-                        running[task.key] = _Running(
-                            task, proc, parent, task_hash
-                        )
-                        del pending[task.key]
-                        used_threads += task.threads
-                        used_mem += task.memory_gb
-                        progressed = True
-                if fatal is not None:
+            while state.pending or state.running:
+                progressed = self._cancel_blocked(state)
+                progressed |= self._start_ready(state)
+                if state.fatal is not None:
                     break
-                if not running:
-                    if pending and not progressed:
+                if not state.running:
+                    if state.pending and not progressed:
                         raise SchedulerError(
-                            f"no runnable task among {sorted(pending)}"
+                            f"no runnable task among {sorted(state.pending)}"
                         )
                     continue
                 waitables: list[Any] = []
-                for run_ in running.values():
+                for run_ in state.running.values():
                     waitables += [run_.conn, run_.process.sentinel]
                 multiprocessing.connection.wait(waitables, timeout=1.0)
-                for key in list(running):
-                    run_ = running[key]
-                    task = run_.task
-                    message = None
-                    ready_ = run_.conn.poll()
-                    if not ready_:
-                        if run_.process.is_alive():
-                            continue
-                        # The worker may have sent its result and exited
-                        # between the two checks; look again before
-                        # declaring it dead.
-                        ready_ = run_.conn.poll()
-                    if ready_:
-                        try:
-                            message = run_.conn.recv()
-                        except EOFError:
-                            message = None
-                    run_.process.join()
-                    run_.conn.close()
-                    del running[key]
-                    used_threads -= task.threads
-                    used_mem -= task.memory_gb
-                    if message is None:
-                        fail(
-                            task, f"worker died (exit {run_.process.exitcode})"
-                        )
-                    else:
-                        outcome, usage = message
-                        wall, cpu, rss = usage
-                        if outcome[0] == "ok":
-                            report.results[key] = outcome[1]
-                            hashes[key] = run_.task_hash
-                            finished = datetime.datetime.now(
-                                datetime.UTC
-                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                            self._write_marker(
-                                task,
-                                run_.task_hash,
-                                outcome[1],
-                                {
-                                    "wall_s": wall,
-                                    "cpu_s": cpu,
-                                    "peak_rss_mb": rss,
-                                    "finished": finished,
-                                },
-                            )
-                            self.timings.append(
-                                Timing(
-                                    key,
-                                    task.group or "",
-                                    "done",
-                                    task.threads,
-                                    wall,
-                                    cpu,
-                                    rss,
-                                    finished,
-                                )
-                            )
-                        else:
-                            fail(task, outcome[1], wall)
-                            self.timings[-1] = dataclasses.replace(
-                                self.timings[-1], cpu_s=cpu, peak_rss_mb=rss
-                            )
-                            LOGGER.debug("%s traceback:\n%s", key, outcome[2])
-                    if key in report.failures and task.group is None:
-                        fatal = (key, report.failures[key])
-                if fatal is not None:
+                self._reap(state)
+                if state.fatal is not None:
                     break
         finally:
-            for run_ in running.values():
+            for run_ in state.running.values():
                 self._terminate(run_)
             self._restore_signal_handlers(previous)
-        if fatal is not None:
-            for key in pending:
-                report.failures.setdefault(key, "cancelled: run stopped")
-            raise GlobalStepError(fatal[0], fatal[1], report)
-        return report
+        if state.fatal is not None:
+            for key in state.pending:
+                state.report.failures.setdefault(key, "cancelled: run stopped")
+            raise GlobalStepError(*state.fatal, state.report)
+        return state.report
+
+    def _fail(
+        self, state: _State, task: Task, message: str, wall: float = 0.0
+    ) -> None:
+        """Records a failed task."""
+        state.report.failures[task.key] = message
+        self.timings.append(
+            Timing(task.key, task.group or "", "failed", task.threads, wall)
+        )
+        LOGGER.error("%s failed: %s", task.key, message)
+
+    def _cancel_blocked(self, state: _State) -> bool:
+        """Cancels pending tasks whose dependency failed or was cancelled."""
+        failures = state.report.failures
+        progressed = False
+        for key in list(state.pending):
+            task = state.pending[key]
+            bad = [d for d in task.deps if d in failures]
+            if bad:
+                del state.pending[key]
+                failures[key] = f"cancelled: {bad[0]} failed"
+                self.timings.append(
+                    Timing(key, task.group or "", "cancelled", task.threads)
+                )
+                progressed = True
+        return progressed
+
+    def _start_ready(self, state: _State) -> bool:
+        """Resumes or starts ready tasks, highest priority first.
+
+        Returns:
+            True if any task changed state. A failing global step sets
+            ``state.fatal`` and ends the pass.
+        """
+        report = state.report
+        ready = sorted(
+            (
+                t
+                for t in state.pending.values()
+                if all(d in report.results for d in t.deps)
+            ),
+            key=lambda t: (-t.priority, t.key),
+        )
+        progressed = False
+        for task in ready:
+            dep_results = {d: report.results[d] for d in task.deps}
+            task_hash = state.queued.get(task.key)
+            if task_hash is None:
+                # Inputs and dependency results are fixed once a task is
+                # ready, so a task waiting for budget is hashed only once.
+                try:
+                    task_hash = self._task_hash(
+                        task, dep_results, [state.hashes[d] for d in task.deps]
+                    )
+                except Exception as err:  # noqa: BLE001
+                    del state.pending[task.key]
+                    self._fail(state, task, f"hashing inputs: {err}")
+                    progressed = True
+                    if task.group is None:
+                        state.fatal = (task.key, report.failures[task.key])
+                        break
+                    continue
+                hit, result, stored = self._try_resume(task, task_hash)
+                if hit:
+                    del state.pending[task.key]
+                    state.hashes[task.key] = task_hash
+                    report.results[task.key] = result
+                    report.skipped.append(task.key)
+                    self.timings.append(
+                        Timing(
+                            task.key,
+                            task.group or "",
+                            "cached",
+                            task.threads,
+                            *_stored_usage(stored),
+                        )
+                    )
+                    progressed = True
+                    continue
+                state.queued[task.key] = task_hash
+            if (
+                state.used_threads + task.threads > self.threads
+                or state.used_mem + task.memory_gb > self.max_memory_gb
+            ):
+                continue
+            self.marker_path(task.key).unlink(missing_ok=True)
+            parent, child = self._ctx.Pipe(duplex=False)
+            proc = self._ctx.Process(
+                target=_worker,
+                args=(child, task.fn, dep_results),
+                name=task.key,
+            )
+            proc.start()
+            child.close()
+            state.running[task.key] = _Running(task, proc, parent, task_hash)
+            del state.pending[task.key]
+            state.used_threads += task.threads
+            state.used_mem += task.memory_gb
+            progressed = True
+        return progressed
+
+    def _reap(self, state: _State) -> None:
+        """Collects finished workers; a global failure sets ``state.fatal``."""
+        report = state.report
+        for key in list(state.running):
+            run_ = state.running[key]
+            task = run_.task
+            message = None
+            done = run_.conn.poll()
+            if not done:
+                if run_.process.is_alive():
+                    continue
+                # The worker may have sent its result and exited between the
+                # two checks; look again before declaring it dead.
+                done = run_.conn.poll()
+            if done:
+                try:
+                    message = run_.conn.recv()
+                except EOFError:
+                    message = None
+            run_.process.join()
+            run_.conn.close()
+            del state.running[key]
+            state.used_threads -= task.threads
+            state.used_mem -= task.memory_gb
+            if message is None:
+                self._fail(
+                    state, task, f"worker died (exit {run_.process.exitcode})"
+                )
+            else:
+                outcome, (wall, cpu, rss) = message
+                if outcome[0] == "ok":
+                    report.results[key] = outcome[1]
+                    state.hashes[key] = run_.task_hash
+                    finished = datetime.datetime.now(datetime.UTC).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    )
+                    usage = {
+                        "wall_s": wall,
+                        "cpu_s": cpu,
+                        "peak_rss_mb": rss,
+                        "finished": finished,
+                    }
+                    self._write_marker(task, run_.task_hash, outcome[1], usage)
+                    self.timings.append(
+                        Timing(
+                            key,
+                            task.group or "",
+                            "done",
+                            task.threads,
+                            wall,
+                            cpu,
+                            rss,
+                            finished,
+                        )
+                    )
+                else:
+                    self._fail(state, task, outcome[1], wall)
+                    self.timings[-1] = dataclasses.replace(
+                        self.timings[-1], cpu_s=cpu, peak_rss_mb=rss
+                    )
+                    LOGGER.debug("%s traceback:\n%s", key, outcome[2])
+            if key in report.failures and task.group is None:
+                state.fatal = (key, report.failures[key])
 
     @staticmethod
     def _install_signal_handlers() -> dict[int, Any]:

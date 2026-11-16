@@ -40,7 +40,7 @@ import os
 import tempfile
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import astuple, dataclass
 from importlib import resources
 from pathlib import Path
 
@@ -322,10 +322,12 @@ def build_rccx_sites(
         proc.ToolError: If blastn fails.
     """
     table = load_gene_table(genes_tsv)
-    fasta = pysam.FastaFile(str(reference))
-    lengths = dict(zip(fasta.references, fasta.lengths, strict=True))
     sites: list[Site] = []
-    with tempfile.TemporaryDirectory(prefix="rccx_blast_") as tmp:
+    with (
+        pysam.FastaFile(str(reference)) as fasta,
+        tempfile.TemporaryDirectory(prefix="rccx_blast_") as tmp,
+    ):
+        lengths = dict(zip(fasta.references, fasta.lengths, strict=True))
         for family in table.families():
             prox, dist = table.pair(family)
             for gene in (prox, dist):
@@ -378,19 +380,7 @@ def build_rccx_sites(
     with open(partial, "w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
         writer.writerow(SITE_COLUMNS)
-        for site in sites:
-            writer.writerow(
-                [
-                    site.family,
-                    site.chrom,
-                    site.pos,
-                    site.distal_gene,
-                    site.proximal_gene,
-                    site.distal_base,
-                    site.proximal_base,
-                    site.proximal_pos,
-                ]
-            )
+        writer.writerows(astuple(site) for site in sites)
     os.replace(partial, out_tsv)
     return len(sites)
 
@@ -422,11 +412,12 @@ def load_sites(path: Path) -> dict[str, list[Site]]:
 
 def _vcf_genotypes(
     vcf_path: Path, haps: Sequence[str], chrom: str, lo: int, hi: int
-) -> dict[str, dict[int, list[tuple[str, str, str]]]]:
-    """Return {hap: {pos: [(ref, alt, gt)]}} for records in [lo, hi].
+) -> tuple[dict[str, dict[int, list[tuple[str, str, str]]]], set[str]]:
+    """Return ({hap: {pos: [(ref, alt, gt)]}}, VCF sample names).
 
-    gt is "1", "0" or "." from the first genotype allele (haploid).
-    Haplotypes absent from the VCF get an empty dict.
+    Records are those of ``chrom`` at 1-based positions in [lo, hi]; gt is
+    "1", "0" or "." from the first genotype allele (haploid). Haplotypes
+    absent from the VCF get an empty dict.
     """
     out: dict[str, dict[int, list[tuple[str, str, str]]]] = {
         h: defaultdict(list) for h in haps
@@ -453,7 +444,7 @@ def _vcf_genotypes(
                 else:
                     gt = "1" if call[0] > 0 else "0"
                 out[hap][rec.pos].append((rec.ref, rec.alts[0], gt))
-    return {h: dict(v) for h, v in out.items()}
+    return {h: dict(v) for h, v in out.items()}, set(samples)
 
 
 def _depths(
@@ -471,80 +462,83 @@ def _depths(
     return {p: depth[p - lo] for p in positions}
 
 
-def _covered(
-    bam_path: Path, chrom: str, positions: Sequence[int], min_depth: int
-) -> set[int]:
-    """Return the 1-based positions with depth >= min_depth in the BAM."""
-    depth = _depths(bam_path, chrom, positions)
-    return {p for p, d in depth.items() if d >= min_depth}
+Records = list[tuple[str, str, str]] | None
+
+
+def _vote(
+    records: Records,
+    elsewhere: bool,
+    covered: bool | None,
+    ref_vote: str,
+    alt_vote: str,
+    ref_base: str,
+    alt_base: str,
+) -> str:
+    """Return the vote of one haplotype in one gene-copy frame.
+
+    ``ref_vote`` is the vote of the reference allele in that frame and
+    ``alt_vote`` that of the single expected REF/ALT change. A site without
+    a VCF record counts as reference only if it is provably callable: the
+    haplotype BAM has the minimum depth there (``covered``), or, without a
+    BAM, another haplotype has a record there (``elsewhere``). Otherwise it
+    is missing.
+    """
+    if not records:
+        seen = covered if covered is not None else elsewhere
+        return ref_vote if seen else "missing"
+    gts = {gt for _ref, _alt, gt in records}
+    if "1" in gts:
+        hit = any(
+            gt == "1" and ref == ref_base and alt == alt_base
+            for ref, alt, gt in records
+        )
+        return alt_vote if hit else "other"
+    return ref_vote if "0" in gts else "missing"
 
 
 def _site_vote(
-    site: Site,
-    records: list[tuple[str, str, str]] | None,
-    callable_elsewhere: bool,
-    covered: bool | None,
+    site: Site, records: Records, callable_elsewhere: bool, covered: bool | None
 ) -> str:
-    """Return proximal, distal, other or missing for one haplotype.
-
-    A site without any VCF record for the haplotype counts as distal
-    (reference) only if it is provably callable: the haplotype BAM has the
-    minimum depth there (``covered``), or, without a BAM, some other
-    haplotype has a record there. Otherwise it is missing, not reference.
-    """
-    if not records:
-        if covered is not None:
-            return "distal" if covered else "missing"
-        return "distal" if callable_elsewhere else "missing"
-    gts = {gt for _ref, _alt, gt in records}
-    if "1" in gts:
-        for ref, alt, gt in records:
-            if (
-                gt == "1"
-                and ref == site.distal_base
-                and alt == site.proximal_base
-            ):
-                return "proximal"
-        return "other"
-    return "distal" if "0" in gts else "missing"
+    """Return proximal, distal, other or missing in the distal frame."""
+    return _vote(
+        records,
+        callable_elsewhere,
+        covered,
+        "distal",
+        "proximal",
+        site.distal_base,
+        site.proximal_base,
+    )
 
 
 def _proximal_frame_vote(
-    site: Site,
-    records: list[tuple[str, str, str]] | None,
-    callable_elsewhere: bool,
-    covered: bool | None,
+    site: Site, records: Records, callable_elsewhere: bool, covered: bool | None
 ) -> str:
     """Return the vote of a read realigned to the proximal gene copy.
 
     Mirror of ``_site_vote`` at ``site.proximal_pos``: there the proximal
-    base is the reference, so reference (GT 0, or no record on a covered
-    position) is a proximal-type vote and the distal base is the ALT.
+    base is the reference, so reference is a proximal-type vote and the
+    distal base is the ALT.
     """
-    if not records:
-        seen = covered if covered is not None else callable_elsewhere
-        return "proximal" if seen else "missing"
-    gts = {gt for _ref, _alt, gt in records}
-    if "1" in gts:
-        for ref, alt, gt in records:
-            if (
-                gt == "1"
-                and ref == site.proximal_base
-                and alt == site.distal_base
-            ):
-                return "distal"
-        return "other"
-    return "proximal" if "0" in gts else "missing"
+    return _vote(
+        records,
+        callable_elsewhere,
+        covered,
+        "proximal",
+        "distal",
+        site.proximal_base,
+        site.distal_base,
+    )
 
 
-def _has_call(records: list[tuple[str, str, str]] | None) -> bool:
+def _has_call(records: Records) -> bool:
     return bool(records) and any(gt in ("0", "1") for _r, _a, gt in records)
 
 
 def _frame_vote(
     site: Site,
-    dist: tuple[list[tuple[str, str, str]] | None, bool, int | None],
-    prox: tuple[list[tuple[str, str, str]] | None, bool, int | None],
+    dist: tuple[Records, bool, int | None],
+    prox: tuple[Records, bool, int | None],
     min_depth: int,
     use_bam: bool,
 ) -> str:
@@ -561,30 +555,25 @@ def _frame_vote(
     decides; a site without any record is reference in the single frame
     where another haplotype was called, otherwise missing.
     """
-    known = site.proximal_pos > 0
     d_rec, d_else, d_depth = dist
     p_rec, p_else, p_depth = prox
-
-    def distal_vote() -> str:
-        cov = None if d_depth is None else d_depth >= min_depth
-        return _site_vote(site, d_rec, d_else, cov)
-
-    def proximal_vote() -> str:
-        cov = None if p_depth is None else p_depth >= min_depth
-        return _proximal_frame_vote(site, p_rec, p_else, cov)
-
-    if not known:
-        return distal_vote()
+    in_distal = _site_vote(
+        site, d_rec, d_else, None if d_depth is None else d_depth >= min_depth
+    )
+    if site.proximal_pos <= 0:
+        return in_distal
+    in_proximal = _proximal_frame_vote(
+        site, p_rec, p_else, None if p_depth is None else p_depth >= min_depth
+    )
     if use_bam:
-        d_ok = (d_depth or 0) >= min_depth
-        p_ok = (p_depth or 0) >= min_depth
-        if p_ok and (not d_ok or (p_depth or 0) > (d_depth or 0)):
-            return proximal_vote()
-        return distal_vote()
+        d_depth, p_depth = d_depth or 0, p_depth or 0
+        if p_depth >= min_depth and (d_depth < min_depth or p_depth > d_depth):
+            return in_proximal
+        return in_distal
     if _has_call(d_rec):
-        return distal_vote()
+        return in_distal
     if _has_call(p_rec):
-        return proximal_vote()
+        return in_proximal
     if d_else and not p_else:
         return "distal"
     if p_else and not d_else:
@@ -597,7 +586,7 @@ def _side(
     hap: str,
     pos: int,
     depth: Mapping[int, int] | None,
-) -> tuple[list[tuple[str, str, str]] | None, bool, int | None]:
+) -> tuple[Records, bool, int | None]:
     """Return (records, called in another haplotype, depth) at a position.
 
     depth is None without a haplotype BAM.
@@ -723,14 +712,6 @@ def vote_haplotype(
     return result
 
 
-def _gene_of_call(call: str, prox: str, dist: str) -> str:
-    return {"proximal_type": prox, "distal_type": dist}.get(call, "")
-
-
-def _like_gene_of_call(call: str, prox: str, dist: str) -> str:
-    return {"proximal_like": prox, "distal_like": dist}.get(call, "")
-
-
 def _prefix(family: str) -> str:
     return "cyp21_blast" if family == "CYP21" else family.lower()
 
@@ -803,9 +784,7 @@ def classify_rccx(
     coords = [p for s in all_sites for p in (s.pos, s.proximal_pos) if p > 0]
     lo = min(coords, default=1)
     hi = max(coords, default=1)
-    gts = _vcf_genotypes(merged_vcf, haps, chrom, lo, hi)
-    with pysam.VariantFile(str(merged_vcf)) as vcf:
-        vcf_samples = set(vcf.header.samples)
+    gts, vcf_samples = _vcf_genotypes(merged_vcf, haps, chrom, lo, hi)
 
     votes_by: dict[tuple[str, str], dict[int, str]] = {}
     coverage_source: dict[str, str] = {}
@@ -821,8 +800,7 @@ def classify_rccx(
             if unobserved:
                 votes_by[(hap, family)] = {s.pos: "missing" for s in sites}
                 continue
-            d_depth: dict[int, int] = {}
-            p_depth: dict[int, int] = {}
+            d_depth = p_depth = None
             if use_bam:
                 d_depth = _depths(bam, chrom, [s.pos for s in sites])
                 p_depth = _depths(
@@ -830,46 +808,38 @@ def classify_rccx(
                     chrom,
                     [s.proximal_pos for s in sites if s.proximal_pos],
                 )
-
-            votes: dict[int, str] = {}
-            for site in sites:
-                votes[site.pos] = _frame_vote(
+            votes_by[(hap, family)] = {
+                site.pos: _frame_vote(
                     site,
-                    _side(gts, hap, site.pos, d_depth if use_bam else None),
-                    _side(
-                        gts,
-                        hap,
-                        site.proximal_pos,
-                        p_depth if use_bam else None,
-                    ),
+                    _side(gts, hap, site.pos, d_depth),
+                    _side(gts, hap, site.proximal_pos, p_depth),
                     min_depth,
                     use_bam,
                 )
-            votes_by[(hap, family)] = votes
-
-    def tidy(group: Sequence[str]) -> list[str]:
-        for hap in group:
-            if hap not in details:
-                raise ValueError(f"allele lists unknown haplotype {hap!r}")
-        return list(group)
+                for site in sites
+            }
 
     def cyp21_gene(hap: str) -> str:
         return cyp_prox.name if region["hap_variants"][hap] else cyp_dist.name
 
-    groups = [tidy(g) for g in region["alleles_final"]]
+    listed_groups = region["alleles_final"]
+    for group in listed_groups:
+        for hap in group:
+            if hap not in details:
+                raise ValueError(f"allele lists unknown haplotype {hap!r}")
+    groups = [list(g) for g in listed_groups]
     tags = list(region.get("annotated_alleles") or [])
     assigned = {h for g in groups for h in g}
     groups += [[h] for h in haps if h not in assigned]
     rows: list[dict[str, object]] = []
     for index, group in enumerate(groups):
-        listed = index < len(region["alleles_final"])
+        listed = index < len(listed_groups)
         ordered = sorted(
             group, key=lambda h: 0 if cyp21_gene(h) == cyp_prox.name else 1
         )
         n_mod = len(group)
         for hap in ordered:
             lo_b, hi_b = details[hap]["boundary"]
-            marker = region["hap_variants"][hap]
             if n_mod == 1 and listed:
                 position = "sole"
             elif cyp21_gene(hap) == cyp_prox.name:
@@ -893,7 +863,7 @@ def classify_rccx(
                 "module_position": position,
                 "hap": hap,
                 "cyp21_paraphase": cyp21_gene(hap),
-                "cyp21_marker_hits": len(marker),
+                "cyp21_marker_hits": len(region["hap_variants"][hap]),
                 "coverage_source": coverage_source[hap],
             }
             extra: dict[str, object] = {}
@@ -907,10 +877,12 @@ def classify_rccx(
                     like_calls=family in LIKE_FAMILIES,
                 )
                 pre = _prefix(family)
-                row[f"{pre}_call"] = res["call"]
-                row[f"{pre}_gene"] = _gene_of_call(
-                    str(res["call"]), prox.name, dist.name
-                )
+                call = str(res["call"])
+                row[f"{pre}_call"] = call
+                row[f"{pre}_gene"] = {
+                    "proximal_type": prox.name,
+                    "distal_type": dist.name,
+                }.get(call, "")
                 for key in (
                     "n_sites",
                     "n_informative",
@@ -921,9 +893,10 @@ def classify_rccx(
                 ):
                     row[f"{pre}_{key}"] = res[key]
                 if family in LIKE_FAMILIES:
-                    extra[f"{pre}_like_gene"] = _like_gene_of_call(
-                        str(res["call"]), prox.name, dist.name
-                    )
+                    extra[f"{pre}_like_gene"] = {
+                        "proximal_like": prox.name,
+                        "distal_like": dist.name,
+                    }.get(call, "")
                     extra[f"{pre}_like_pct"] = res["like_pct"]
                     extra[f"{pre}_matching_sites"] = res["n_matching"]
                     extra[f"{pre}_covered_sites"] = res["n_informative"]
@@ -998,10 +971,6 @@ def _label_for(row: Mapping[str, object], family: str) -> tuple[str, str, str]:
     return kind, "", pct if kind == "mixed" else ""
 
 
-def _display(table: GeneTable, name: str) -> str:
-    return table.gene(name).display
-
-
 def _set_font() -> dict[str, object]:
     return {**base_rc(), "hatch.linewidth": 0.5}
 
@@ -1025,13 +994,13 @@ def _table_cells(
                 f"{row.get(f'{pre}_covered_sites', '')})"
             )
         if kind == "like":
-            return f"{_display(table, gene)}-like{detail}"
+            return f"{table.gene(gene).display}-like{detail}"
         if gene:
-            return _display(table, gene)
+            return table.gene(gene).display
         return kind + detail
 
     cyp_blast = fam_text("CYP21")
-    cyp = f"{_display(table, str(row['cyp21_paraphase']))}/{cyp_blast}" + (
+    cyp = f"{table.gene(str(row['cyp21_paraphase'])).display}/{cyp_blast}" + (
         " *" if _conflict(row) else ""
     )
     return [
@@ -1074,67 +1043,41 @@ def _draw_box(
 ) -> None:
     kind, gene, pct = _label_for(row, family)
     prox, dist = table.pair(family)
-    ax_kw = {"linewidth": 0.5, "edgecolor": EDGE}
+    edge = {"linewidth": 0.5, "edgecolor": EDGE}
+
+    def box(left: float = x, w: float = width, **kwargs: object) -> None:
+        ax.add_patch(Rectangle((left, y), w, height, **kwargs))
+
+    bbox = None
     if kind == "like":
-        ax.add_patch(
-            Rectangle(
-                (x, y),
-                width,
-                height,
-                facecolor="#FFFFFF",
-                linewidth=LIKE_LINEWIDTH,
-                edgecolor=GENE_COLORS.get(gene, "#999999"),
-            )
+        box(
+            facecolor="#FFFFFF",
+            linewidth=LIKE_LINEWIDTH,
+            edgecolor=GENE_COLORS.get(gene, "#999999"),
         )
-        name = _display(table, gene)
+        name = table.gene(gene).display
         short = name if like_fits else _short_name(name, family)
-        label = f"{short}-like\n{pct}%"
-        color, bbox = "#000000", None
+        label, color = f"{short}-like\n{pct}%", "#000000"
     elif gene:
         fill = GENE_COLORS.get(gene, "#999999")
-        ax.add_patch(Rectangle((x, y), width, height, facecolor=fill, **ax_kw))
-        name = _display(table, gene)
+        box(facecolor=fill, **edge)
+        name = table.gene(gene).display
         label = name if fits else _short_name(name, family)
-        color, bbox = _text_on(fill), None
+        color = _text_on(fill)
     else:
         if kind == "chimeric":
             for k, g in enumerate((prox, dist)):
-                ax.add_patch(
-                    Rectangle(
-                        (x + k * width / 2, y),
-                        width / 2,
-                        height,
-                        facecolor=GENE_COLORS.get(g.name, "#999999"),
-                        linewidth=0,
-                    )
+                box(
+                    x + k * width / 2,
+                    width / 2,
+                    facecolor=GENE_COLORS.get(g.name, "#999999"),
+                    linewidth=0,
                 )
-            ax.add_patch(
-                Rectangle(
-                    (x, y), width, height, fill=False, hatch="////", **ax_kw
-                )
-            )
+            box(fill=False, hatch="////", **edge)
         elif kind == "mixed":
-            ax.add_patch(
-                Rectangle(
-                    (x, y),
-                    width,
-                    height,
-                    facecolor=UNRESOLVED_FILL[kind],
-                    hatch="xxxx",
-                    **ax_kw,
-                )
-            )
+            box(facecolor=UNRESOLVED_FILL[kind], hatch="xxxx", **edge)
         else:
-            ax.add_patch(
-                Rectangle(
-                    (x, y),
-                    width,
-                    height,
-                    facecolor=UNRESOLVED_FILL[kind],
-                    linestyle="--",
-                    **ax_kw,
-                )
-            )
+            box(facecolor=UNRESOLVED_FILL[kind], linestyle="--", **edge)
         label, color = kind, "#000000"
         if kind == "mixed" and pct:
             label = f"mixed\n{pct}%"

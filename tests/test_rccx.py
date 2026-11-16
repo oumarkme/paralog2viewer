@@ -245,7 +245,7 @@ def test_site_vote_rules():
     assert vote(site, None, True, False) == "missing"
 
 
-def test_covered_uses_hap_bam_depth(tmp_path: Path):
+def test_depths_count_hap_bam_reads(tmp_path: Path):
     bam_path = tmp_path / "reads.bam"
     header = {
         "HD": {"VN": "1.6", "SO": "coordinate"},
@@ -262,8 +262,8 @@ def test_covered_uses_hap_bam_depth(tmp_path: Path):
             seg.query_qualities = pysam.qualitystring_to_array("I" * 100)
             out.write(seg)
     pysam.index(str(bam_path))
-    got = rccx._covered(bam_path, "chr6", [99, 100, 199, 200], 3)
-    assert got == {100, 199}
+    got = rccx._depths(bam_path, "chr6", [99, 100, 199, 200])
+    assert got == {99: 0, 100: 3, 199: 3, 200: 0}
 
 
 def test_proximal_frame_vote_rules():

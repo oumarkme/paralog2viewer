@@ -130,7 +130,7 @@ def clair3_command(
         threads: Thread count.
         model_path: Clair3 model directory.
     """
-    cmd = [
+    return [
         "run_clair3.sh",
         f"--bam_fn={bam}",
         f"--ref_fn={reference}",
@@ -149,7 +149,6 @@ def clair3_command(
         "--no_phasing_for_fa",
         "--chunk_size=250000000",
     ]
-    return cmd
 
 
 def sawfish_commands(
@@ -301,7 +300,9 @@ def call_sawfish(hap_dir: Path, reference: Path, *, threads: int = 4) -> Path:
     return target
 
 
-def _sample_fields(record: pysam.VariantRecord, hap: str, alt_index: int):
+def _sample_fields(
+    record: pysam.VariantRecord, hap: str, alt_index: int
+) -> dict[str, object]:
     """Return DP, AD, AF, GQ (and SR for Sawfish) of one ALT allele."""
     sample = record.samples[hap]
     fields: dict[str, object] = {}
@@ -376,8 +377,7 @@ def combine_calls(
         header = source.header.copy()
         for record in source:
             alt = record.alts[0]
-            explicit = is_explicit(record.ref, alt)
-            if explicit and (
+            if is_explicit(record.ref, alt) and (
                 record.chrom != chrom
                 or record.start < start0
                 or record.stop > end0

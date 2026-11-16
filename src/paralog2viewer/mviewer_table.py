@@ -286,8 +286,9 @@ def _vep_symbols(record: Mapping) -> list[str]:
 
 def _gene(record: Mapping) -> str:
     """Return the ``Gene`` cell for a record."""
-    symbols = _vep_symbols(record) or [record["gene"]] * bool(record["gene"])
-    symbols = symbols or list(record["genes"])
+    symbols = _vep_symbols(record)
+    if not symbols:
+        symbols = [record["gene"]] if record["gene"] else list(record["genes"])
     return ";".join(symbols)
 
 
@@ -466,17 +467,14 @@ def _haplotype_calls(
         samples = list(vcf.header.samples)
         for rec in vcf:
             alts = rec.alts or ()
-            carriers = [
-                (i, name)
-                for i, name in enumerate(samples)
-                for gt in [rec.samples[name]["GT"]]
-                if gt and None not in gt and any(g > 0 for g in gt)
-            ]
-            if not carriers:
-                continue
-            cols = str(rec).rstrip("\n").split("\t")
-            for sample_index, name in carriers:
+            cols = None
+            for sample_index, name in enumerate(samples):
                 gt = rec.samples[name]["GT"]
+                if not gt or None in gt or not any(g > 0 for g in gt):
+                    continue
+                if cols is None:
+                    cols = str(rec).rstrip("\n").split("\t")
+                filter_ = cols[6] if cols[6] not in ("", ".") else "PASS"
                 for alt_index in sorted({g for g in gt if g > 0}):
                     yield (
                         {
@@ -487,9 +485,7 @@ def _haplotype_calls(
                             "alt": alts[alt_index - 1],
                             "id": rec.id or ".",
                             "qual": cols[5],
-                            "filter": (
-                                cols[6] if cols[6] not in ("", ".") else "PASS"
-                            ),
+                            "filter": filter_,
                             "info": cols[7],
                             "format": cols[8],
                             "sample": cols[9 + sample_index],

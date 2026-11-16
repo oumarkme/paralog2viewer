@@ -102,16 +102,10 @@ def prepare_haplotype(
     """
     hap_dir = Path(work_dir) / "hap" / job.hp
     hap_dir.mkdir(parents=True, exist_ok=True)
-    outputs = {
-        name: hap_dir / name
-        for name in (
-            "reads.bam",
-            "reads.bam.bai",
-            "region.bed",
-            "expected_cn.bed",
-        )
-    }
-    for path in outputs.values():
+    reads_bam = hap_dir / "reads.bam"
+    region_bed = hap_dir / "region.bed"
+    expected_cn = hap_dir / "expected_cn.bed"
+    for path in (reads_bam, hap_dir / "reads.bam.bai", region_bed, expected_cn):
         path.unlink(missing_ok=True)
     with pysam.AlignmentFile(str(job.source_bam), "rb") as source:
         if not any(not r.flag & 0x900 for r in source.fetch(until_eof=True)):
@@ -178,22 +172,20 @@ def prepare_haplotype(
     audit_path = hap_dir / "alignment_audit.json"
     audit_path.write_text(json.dumps(audit, indent=2) + "\n")
     if audit["status"] != "ready":
-        outputs["reads.bam"].unlink(missing_ok=True)
+        reads_bam.unlink(missing_ok=True)
         return None
     start, end = audit["report_start0"], audit["report_end0"]
-    outputs["region.bed"].write_text(f"{job.chrom}\t{start}\t{end}\n")
-    outputs["expected_cn.bed"].write_text(
-        f"{job.chrom}\t0\t{contig_length}\t{job.hp}\t1\n"
-    )
-    run(["samtools", "index", "-@", str(threads), outputs["reads.bam"]])
-    run(["samtools", "quickcheck", outputs["reads.bam"]])
+    region_bed.write_text(f"{job.chrom}\t{start}\t{end}\n")
+    expected_cn.write_text(f"{job.chrom}\t0\t{contig_length}\t{job.hp}\t1\n")
+    run(["samtools", "index", "-@", str(threads), reads_bam])
+    run(["samtools", "quickcheck", reads_bam])
     return PreparedHaplotype(
         region=job.region,
         hp=job.hp,
         chrom=job.chrom,
-        bam=outputs["reads.bam"],
-        bed=outputs["region.bed"],
-        expected_cn=outputs["expected_cn.bed"],
+        bam=reads_bam,
+        bed=region_bed,
+        expected_cn=expected_cn,
         audit=audit_path,
         start=start,
         end=end,

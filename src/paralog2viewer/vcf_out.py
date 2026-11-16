@@ -146,28 +146,14 @@ def csq_entries(
                     value = value.replace(",", "&")
             else:
                 value = tx["plugins"].get(name, "")
-            cells.append(
-                "&".join(_escape(v) for v in value.split("&"))
-                if name == "Consequence"
-                else _escape(value)
-            )
+            cells.append(_escape(value))
         entries.append("|".join(cells))
     return tuple(entries)
 
 
 def _clnsig(record: Mapping) -> str:
     """Return the ClinVar significance of a record, or ``""``."""
-    value = record["clinvar"]
-    if not value:
-        value = next(
-            (
-                v
-                for k, v in record["annovar"].items()
-                if k.lower() == "clnsig" and v != "."
-            ),
-            "",
-        )
-    return value
+    return record["clinvar"] or _annovar_value(record, "CLNSIG")
 
 
 def _tag_value(text: str) -> str:

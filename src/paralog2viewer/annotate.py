@@ -125,18 +125,6 @@ VEP_CACHE_VERSION = "116"
 # output; its name in VEP 116 is not verified.
 VEP_ADDED_OPTIONS = ("--hgvs", "--mane")
 VEP_SYMBOLIC_OPTIONS = ("--canonical", "--numbers", "--mane")
-VEP_TRANSCRIPT_KEYS = (
-    "IMPACT",
-    "SYMBOL",
-    "BIOTYPE",
-    "CANONICAL",
-    "MANE_SELECT",
-    "MANE_PLUS_CLINICAL",
-    "EXON",
-    "INTRON",
-    "HGVSc",
-    "HGVSp",
-)
 VEP_VARIANT_KEYS = (
     "VARIANT_CLASS",
     "MAX_AF",
@@ -314,8 +302,8 @@ def _write_sites(
     path: Path, header: Sequence[str], rows: Sequence[Allele]
 ) -> None:
     """Write a sites-only VCF."""
+    have = "\n".join(header)
     lines = list(header)
-    have = "\n".join(lines)
     for key, number, kind, text in (
         ("END", "1", "Integer", "End position"),
         ("SVTYPE", "1", "String", "SV type"),
@@ -327,21 +315,10 @@ def _write_sites(
                 f'Description="{text}">'
             )
     lines.append("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO")
-    for allele in rows:
-        lines.append(
-            "\t".join(
-                [
-                    allele.chrom,
-                    str(allele.pos),
-                    allele.key,
-                    allele.ref,
-                    allele.alt,
-                    ".",
-                    ".",
-                    allele.info,
-                ]
-            )
-        )
+    lines.extend(
+        f"{a.chrom}\t{a.pos}\t{a.key}\t{a.ref}\t{a.alt}\t.\t.\t{a.info}"
+        for a in rows
+    )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -420,7 +397,7 @@ class RecordCache:
             marks = ",".join("?" * len(chunk))
             rows = self._db.execute(
                 "SELECT allele_key, record FROM records WHERE "
-                f"data_checksum=? AND schema_version=? "
+                "data_checksum=? AND schema_version=? "
                 f"AND allele_key IN ({marks})",
                 [self._checksum, CACHE_SCHEMA, *chunk],
             )

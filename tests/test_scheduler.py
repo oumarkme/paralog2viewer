@@ -98,6 +98,21 @@ def test_memory_guard_serializes_heavy_tasks(tmp_path):
     assert peak == 1
 
 
+def test_task_waiting_for_budget_is_hashed_once(tmp_path, monkeypatch):
+    calls = []
+    real = Pool._task_hash
+
+    def counting(self, task, deps, dep_hashes):
+        calls.append(task.key)
+        return real(self, task, deps, dep_hashes)
+
+    monkeypatch.setattr(Pool, "_task_hash", counting)
+    work = _logger(tmp_path / "log")
+    tasks = [Task(f"w{i}", work(f"w{i}", 0.3), threads=2) for i in range(3)]
+    _pool(tmp_path, threads=2).run(tasks)
+    assert sorted(calls) == ["w0", "w1", "w2"]
+
+
 def test_longest_first_priority(tmp_path):
     log = tmp_path / "log"
     work = _logger(log)

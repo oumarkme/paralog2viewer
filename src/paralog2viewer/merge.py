@@ -206,8 +206,9 @@ def merge_haplotype_calls(
                         sample["GT"] = (1,)
                         for field, value in entry["haps"][hap].items():
                             sample[field] = value
-                    elif is_covered(depths[hap], chrom, pos - 1, len(ref),
-                                    min_depth):  # fmt: skip
+                    elif is_covered(
+                        depths[hap], chrom, pos - 1, len(ref), min_depth
+                    ):
                         sample["GT"] = (0,)
                     else:
                         sample["GT"] = (None,)

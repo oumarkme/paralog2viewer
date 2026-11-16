@@ -489,6 +489,11 @@ def _call_one(
     return call.call_haplotype(prepared.bam.parent, reference, threads=threads)
 
 
+def _merge_annotate_paths(deps: Mapping[str, Any]) -> list[Path]:
+    """Returns the merged VCF and annotation table of the dependencies."""
+    return [deps["merge"], deps["annotate"]]
+
+
 def _output_task(
     key: str,
     fn: Any,
@@ -590,33 +595,23 @@ def run_pipeline(settings: config.RunSettings) -> RunResult:
     return result
 
 
-def _execute(
-    settings: config.RunSettings,
-    info: Inputs,
-    work: Path,
-    out_dir: Path,
-    pool: scheduler.Pool,
-    result: RunResult,
-) -> None:
-    """Steps [1] to [7] under the pool; fills ``result``."""
-    sample = info.sample
+def _split_task(
+    settings: config.RunSettings, info: Inputs, work: Path
+) -> scheduler.Task:
+    """Builds step [1], the global split into haplotype jobs."""
     reference = settings.reference
-    layout = DataLayout(settings.data)
-    budget = settings.threads
-
-    # [1] split (global step).
-    split_threads = min(4, budget)
-    split_task = scheduler.Task(
+    threads = min(4, settings.threads)
+    return scheduler.Task(
         key="split",
         fn=lambda deps: split.split_haplotypes(
             settings.bam,
             info.json_path,
             reference,
             work,
-            split_threads,
-            sample=sample,
+            threads,
+            sample=info.sample,
         ),
-        threads=split_threads,
+        threads=threads,
         memory_gb=MEMORY_GB["split"],
         inputs=[
             settings.bam,
@@ -628,38 +623,40 @@ def _execute(
         encode=_enc_jobs,
         decode=_dec_jobs,
     )
-    jobs = pool.run([split_task]).results["split"]
+
+
+def _execute(
+    settings: config.RunSettings,
+    info: Inputs,
+    work: Path,
+    out_dir: Path,
+    pool: scheduler.Pool,
+    result: RunResult,
+) -> None:
+    """Steps [1] to [7] under the pool; fills ``result``."""
+    jobs = pool.run([_split_task(settings, info, work)]).results["split"]
     if not jobs:
         raise PipelineError("no haplotype with confident reads in the JSON")
-    region_of = {j.hp: j.region for j in jobs}
 
     # [2-4] per haplotype.
     report = pool.run(hap_tasks(jobs, settings, work))
-    failed = {
-        key.split(":", 1)[1]: msg
-        for key, msg in report.failures.items()
-        if not msg.startswith("cancelled")
-    }
-    result.failures.update({f"haplotype {hp}": m for hp, m in failed.items()})
-    good = [
-        j
-        for j in jobs
-        if f"call:{j.hp}" in report.results
-        and report.results[f"call:{j.hp}"] is not None
-    ]
+    result.failures.update(
+        {
+            f"haplotype {key.split(':', 1)[1]}": msg
+            for key, msg in report.failures.items()
+            if not msg.startswith("cancelled")
+        }
+    )
+    good = [j for j in jobs if report.results.get(f"call:{j.hp}") is not None]
     for job in jobs:
-        if (
-            f"prepare:{job.hp}" in report.results
-            and report.results[f"prepare:{job.hp}"] is None
-        ):
+        key = f"prepare:{job.hp}"
+        if key in report.results and report.results[key] is None:
             LOGGER.warning("%s: no read overlaps the locus; skipped", job.hp)
     if not good:
         raise PipelineError(
             "no haplotype produced calls: "
             + "; ".join(f"{k}: {v}" for k, v in result.failures.items())
         )
-    hap_dirs = {j.hp: work / "hap" / j.hp for j in good}
-    dir_list = list(hap_dirs.values())
 
     # [5]-[7] global graph.
     # Figures are drawn in the work directory (so a resume can reuse them),
@@ -667,6 +664,40 @@ def _execute(
     # no figure of an earlier run survives.
     fig_final = out_dir / "figures"
     fig_dir = work / "figures"
+    final = pool.run(
+        _output_tasks(settings, info, work, out_dir, jobs, good, fig_dir)
+    )
+    for key, message in final.failures.items():
+        if not message.startswith("cancelled"):
+            result.failures[key] = message
+    swapped = (
+        settings.figures
+        and not any(k in final.failures for k in ("figures", "rccx"))
+        and _publish_figures(fig_dir, fig_final)
+    )
+    for key in ("vcf", "mviewer", "figures", "rccx"):
+        paths = _paths_of(final.results.get(key))
+        if swapped and key in ("figures", "rccx") and key in final.results:
+            paths = [fig_final / p.relative_to(fig_dir) for p in paths]
+        result.outputs += paths
+
+
+def _output_tasks(
+    settings: config.RunSettings,
+    info: Inputs,
+    work: Path,
+    out_dir: Path,
+    jobs: Sequence[split.HaplotypeJob],
+    good: Sequence[split.HaplotypeJob],
+    fig_dir: Path,
+) -> list[scheduler.Task]:
+    """Builds steps [5] to [7]: merge, region check, annotation, outputs."""
+    sample = info.sample
+    reference = settings.reference
+    layout = DataLayout(settings.data)
+    budget = settings.threads
+    hap_dirs = {j.hp: work / "hap" / j.hp for j in good}
+    dir_list = list(hap_dirs.values())
     cache_path = resolve_cache_path(settings.cache, settings.data, work)
     tasks = [
         scheduler.Task(
@@ -717,116 +748,116 @@ def _execute(
         tasks.append(
             _output_task(
                 "vcf",
-                lambda deps, out=out: vcf_out.write_annotated_vcf(
+                lambda deps: vcf_out.write_annotated_vcf(
                     deps["merge"],
                     deps["annotate"],
                     out,
                     mode=settings.vcf_annotation,
                 ),
                 ["merge", "annotate"],
-                lambda deps: [deps["merge"], deps["annotate"]],
+                _merge_annotate_paths,
                 group="vcf",
                 params={"mode": settings.vcf_annotation},
             )
         )
     if "mviewer" in settings.formats:
-        out = out_dir / f"{sample}.paralog.tsv.gz"
+        table = out_dir / f"{sample}.paralog.tsv.gz"
 
-        def write_table(deps: Mapping[str, Any], out: Path = out) -> Path:
+        def write_table(deps: Mapping[str, Any]) -> Path:
             mviewer_table.write_mviewer_table(
-                deps["annotate"], deps["merge"], sample, info.sex, out
+                deps["annotate"], deps["merge"], sample, info.sex, table
             )
-            return out
+            return table
 
         tasks.append(
             _output_task(
                 "mviewer",
                 write_table,
                 ["merge", "annotate"],
-                lambda deps: [deps["merge"], deps["annotate"]],
+                _merge_annotate_paths,
                 group="mviewer",
                 params={"sex": info.sex, "sample": sample},
             )
         )
     if settings.figures:
-        fig_threads = max(1, min(budget, len(set(region_of.values()))))
-        pseudo = pseudogene_path(settings)
-
-        def draw(deps: Mapping[str, Any]) -> list[Path]:
-            _clear_stale_figures(fig_dir)
-            return plot.plot_regions(
-                deps["merge"],
-                hap_dirs,
-                annotate.pathogenic_allele_keys(deps["annotate"]),
-                pseudo,
-                reference,
-                fig_dir,
-                workers=fig_threads,
-                region_of=region_of,
-                gene_models=gene_models,
-                default_transcripts=layout.default_transcript,
-                hap_info=info.json_path,
-            )
-
-        gene_models = layout.annovar_humandb / "hg38_refGene.txt"
         tasks.append(
-            _output_task(
-                "figures",
-                draw,
-                ["merge", "annotate"],
-                lambda deps: (
-                    [deps["merge"], deps["annotate"], pseudo]
-                    + [gene_models, layout.default_transcript, info.json_path]
-                    + [d / "reads.bam" for d in dir_list]
-                ),
-                group="figures",
-                threads=fig_threads,
-            )
+            _figures_task(settings, info, layout, fig_dir, jobs, hap_dirs)
         )
         if info.has_rccx:
+            tasks.append(_rccx_task(info, layout, work, fig_dir))
+    return tasks
 
-            def draw_rccx(deps: Mapping[str, Any]) -> Path | None:
-                (fig_dir / "RCCX_module.jpeg").unlink(missing_ok=True)
-                rows = rccx.classify_rccx(
-                    info.json_path,
-                    deps["merge"],
-                    layout.rccx_sites,
-                    hap_bam_dir=work / "hap",
-                )
-                if not rows:
-                    LOGGER.warning("RCCX: no haplotype rows; no figure")
-                    return None
-                rccx.write_rccx_table(rows, work / "rccx_calls.tsv")
-                return rccx.plot_rccx_module(rows, fig_dir / "RCCX_module.jpeg")
 
-            tasks.append(
-                _output_task(
-                    "rccx",
-                    draw_rccx,
-                    ["merge"],
-                    lambda deps: [
-                        deps["merge"],
-                        info.json_path,
-                        layout.rccx_sites,
-                    ],
-                    group="rccx",
-                )
-            )
-    final = pool.run(tasks)
-    for key, message in final.failures.items():
-        if not message.startswith("cancelled"):
-            result.failures[key] = message
-    figure_keys = [k for k in ("figures", "rccx") if k in final.results]
-    swapped = (
-        settings.figures
-        and not any(k in final.failures for k in ("figures", "rccx"))
-        and _publish_figures(fig_dir, fig_final)
+def _figures_task(
+    settings: config.RunSettings,
+    info: Inputs,
+    layout: DataLayout,
+    fig_dir: Path,
+    jobs: Sequence[split.HaplotypeJob],
+    hap_dirs: Mapping[str, Path],
+) -> scheduler.Task:
+    """Builds the read-pileup figure task."""
+    region_of = {j.hp: j.region for j in jobs}
+    threads = max(1, min(settings.threads, len(set(region_of.values()))))
+    pseudo = pseudogene_path(settings)
+    gene_models = layout.annovar_humandb / "hg38_refGene.txt"
+
+    def draw(deps: Mapping[str, Any]) -> list[Path]:
+        _clear_stale_figures(fig_dir)
+        return plot.plot_regions(
+            deps["merge"],
+            hap_dirs,
+            annotate.pathogenic_allele_keys(deps["annotate"]),
+            pseudo,
+            settings.reference,
+            fig_dir,
+            workers=threads,
+            region_of=region_of,
+            gene_models=gene_models,
+            default_transcripts=layout.default_transcript,
+            hap_info=info.json_path,
+        )
+
+    return _output_task(
+        "figures",
+        draw,
+        ["merge", "annotate"],
+        lambda deps: (
+            _merge_annotate_paths(deps)
+            + [pseudo, gene_models, layout.default_transcript, info.json_path]
+            + [d / "reads.bam" for d in hap_dirs.values()]
+        ),
+        group="figures",
+        threads=threads,
     )
-    for key in ("vcf", "mviewer", "figures", "rccx"):
-        paths = _paths_of(final.results.get(key))
-        if swapped and key in figure_keys:
-            paths = [fig_final / p.relative_to(fig_dir) for p in paths]
-        result.outputs += paths
+
+
+def _rccx_task(
+    info: Inputs, layout: DataLayout, work: Path, fig_dir: Path
+) -> scheduler.Task:
+    """Builds the RCCX module figure task."""
+
+    def draw_rccx(deps: Mapping[str, Any]) -> Path | None:
+        (fig_dir / "RCCX_module.jpeg").unlink(missing_ok=True)
+        rows = rccx.classify_rccx(
+            info.json_path,
+            deps["merge"],
+            layout.rccx_sites,
+            hap_bam_dir=work / "hap",
+        )
+        if not rows:
+            LOGGER.warning("RCCX: no haplotype rows; no figure")
+            return None
+        rccx.write_rccx_table(rows, work / "rccx_calls.tsv")
+        return rccx.plot_rccx_module(rows, fig_dir / "RCCX_module.jpeg")
+
+    return _output_task(
+        "rccx",
+        draw_rccx,
+        ["merge"],
+        lambda deps: [deps["merge"], info.json_path, layout.rccx_sites],
+        group="rccx",
+    )
 
 
 def _clear_stale_figures(stage: Path) -> None:

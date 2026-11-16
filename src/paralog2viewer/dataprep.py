@@ -244,6 +244,13 @@ def write_bed(path: Path, regions: Iterable[Region]) -> None:
             handle.write(f"{chrom}\t{start}\t{end}\n")
 
 
+def _as_paths(value: str | os.PathLike | Sequence[Path]) -> list[Path]:
+    """Returns ``value`` as a list of paths (a single path is wrapped)."""
+    if isinstance(value, (str, os.PathLike)):
+        return [Path(value)]
+    return [Path(p) for p in value]
+
+
 def regions_from_paraphase_json(path: Path) -> list[Region]:
     """Returns the unpadded loci of every gene in a Paraphase JSON.
 
@@ -329,11 +336,7 @@ def build_regions(
         ValueError: On a contig missing from the reference, a region outside
             its contig, or mixed or empty input.
     """
-    paths = (
-        [Path(inputs)]
-        if isinstance(inputs, (str, os.PathLike))
-        else [Path(p) for p in inputs]
-    )
+    paths = _as_paths(inputs)
     if not paths:
         raise ValueError("no region input given")
     is_json = [p.suffix.lower() == ".json" for p in paths]
@@ -1037,14 +1040,79 @@ def _subset_job(
     kind: str, src: str, dst: str, regions: RegionSet, options: dict
 ) -> tuple[str, int]:
     """Runs one subset in a worker process; returns (name, rows kept)."""
-    source, target = Path(src), Path(dst)
-    if kind == "table":
-        rows = subset_table(source, target, regions, **options)
-    elif kind == "tabix":
-        rows = subset_tabix(source, target, regions, **options)
-    else:
-        rows = subset_annovar_table(source, target, regions, **options)
-    return target.name, rows
+    subset = {
+        "table": subset_table,
+        "tabix": subset_tabix,
+        "annovar": subset_annovar_table,
+    }[kind]
+    target = Path(dst)
+    return target.name, subset(Path(src), target, regions, **options)
+
+
+def _subset_jobs(
+    sources: DataSources, layout: DataLayout, regions: RegionSet
+) -> list[tuple[str, str, str, RegionSet, dict]]:
+    """Lists the (kind, source, target, regions, options) subset jobs."""
+    profile, humandb = sources.profile, sources.annovar_humandb
+    jobs: list[tuple[str, str, str, RegionSet, dict]] = [
+        (
+            "table",
+            str(profile / sources.clinvar_name),
+            str(layout.clinvar),
+            regions,
+            {"keep_values": CLINVAR_ROW_FILTER},
+        ),
+        (
+            "table",
+            str(profile / sources.taiwan_biobank_name),
+            str(layout.taiwan_biobank),
+            regions,
+            {},
+        ),
+        (
+            "tabix",
+            str(profile / sources.hgmd_name),
+            str(layout.hgmd),
+            regions,
+            {"preset": "vcf"},
+        ),
+        (
+            "tabix",
+            str(sources.alphamissense_path),
+            str(layout.alphamissense),
+            regions,
+            {"columns": (0, 1, 1)},
+        ),
+    ]
+    for stem in ANNOVAR_FILTER_DATABASES:
+        name = f"hg38_{stem}.txt"
+        jobs.append(
+            (
+                "annovar",
+                str(humandb / name),
+                str(layout.annovar_humandb / name),
+                regions,
+                {},
+            )
+        )
+    for stem, chrom_col, start_col, end_col in ANNOVAR_REGION_DATABASES:
+        name = f"hg38_{stem}.txt"
+        options = {
+            "chrom_col": chrom_col,
+            "start_col": start_col,
+            "end_col": end_col,
+            "zero_based_start": True,
+        }
+        jobs.append(
+            (
+                "annovar",
+                str(humandb / name),
+                str(layout.annovar_humandb / name),
+                regions,
+                options,
+            )
+        )
+    return jobs
 
 
 def build_data(
@@ -1152,72 +1220,7 @@ def build_data(
     for name in contig_dirs:
         copies += _copy_tree(cache_src / name, cache_dst / name)
 
-    jobs: list[tuple[str, str, str, RegionSet, dict]] = []
-    profile, humandb = sources.profile, sources.annovar_humandb
-    jobs.append(
-        (
-            "table",
-            str(profile / sources.clinvar_name),
-            str(layout.clinvar),
-            region_set,
-            {"keep_values": CLINVAR_ROW_FILTER},
-        )
-    )
-    jobs.append(
-        (
-            "table",
-            str(profile / sources.taiwan_biobank_name),
-            str(layout.taiwan_biobank),
-            region_set,
-            {},
-        )
-    )
-    jobs.append(
-        (
-            "tabix",
-            str(profile / sources.hgmd_name),
-            str(layout.hgmd),
-            region_set,
-            {"preset": "vcf"},
-        )
-    )
-    jobs.append(
-        (
-            "tabix",
-            str(sources.alphamissense_path),
-            str(layout.alphamissense),
-            region_set,
-            {"columns": (0, 1, 1)},
-        )
-    )
-    for stem in ANNOVAR_FILTER_DATABASES:
-        name = f"hg38_{stem}.txt"
-        jobs.append(
-            (
-                "annovar",
-                str(humandb / name),
-                str(layout.annovar_humandb / name),
-                region_set,
-                {},
-            )
-        )
-    for stem, chrom_col, start_col, end_col in ANNOVAR_REGION_DATABASES:
-        name = f"hg38_{stem}.txt"
-        jobs.append(
-            (
-                "annovar",
-                str(humandb / name),
-                str(layout.annovar_humandb / name),
-                region_set,
-                {
-                    "chrom_col": chrom_col,
-                    "start_col": start_col,
-                    "end_col": end_col,
-                    "zero_based_start": True,
-                },
-            )
-        )
-
+    jobs = _subset_jobs(sources, layout, region_set)
     for _, _, dst, _, _ in jobs:
         Path(dst).parent.mkdir(parents=True, exist_ok=True)
     _run_copies(copies, threads)
@@ -1263,14 +1266,7 @@ def build_data(
             "profile": str(sources.profile),
             "alphamissense": str(sources.alphamissense_path),
             "maxentscan": str(sources.maxentscan_path),
-            "regions_input": [
-                str(p)
-                for p in (
-                    [regions]
-                    if isinstance(regions, (str, os.PathLike))
-                    else regions
-                )
-            ],
+            "regions_input": [str(p) for p in _as_paths(regions)],
         },
         "files": records,
     }
@@ -1348,19 +1344,12 @@ def verify_data(
             for rel, digest in zip(present, digests, strict=True):
                 if digest != files[rel]["sha256"]:
                     problems.append(f"checksum differs: {rel}")
-    listed = set(files)
     for path in _list_files(layout.root):
-        if path.relative_to(layout.root).as_posix() not in listed:
-            problems.append(
-                f"unlisted file: {path.relative_to(layout.root).as_posix()}"
-            )
+        rel = path.relative_to(layout.root).as_posix()
+        if rel not in files:
+            problems.append(f"unlisted file: {rel}")
     if calling_bed is not None and layout.regions_bed.exists():
-        beds = (
-            [Path(calling_bed)]
-            if isinstance(calling_bed, (str, os.PathLike))
-            else [Path(p) for p in calling_bed]
-        )
-        calling = [iv for bed in beds for iv in read_bed(bed)]
+        calling = [iv for bed in _as_paths(calling_bed) for iv in read_bed(bed)]
         for chrom, start, end in uncovered_intervals(
             read_bed(layout.regions_bed), calling
         ):
