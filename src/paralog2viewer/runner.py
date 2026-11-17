@@ -235,6 +235,12 @@ def check_inputs(settings: config.RunSettings) -> Inputs:
                 else ""
             )
             raise PipelineError(f"{label} not found: {path}{hint}")
+    for name in call.CLAIR3_MODEL_FILES:
+        if not (Path(call.CLAIR3_MODEL) / name).is_file():
+            raise PipelineError(
+                f"Clair3 model file not found: {call.CLAIR3_MODEL}/{name} "
+                "(download the model and bind-mount it there; see README)"
+            )
     if settings.tmp is not None and not settings.tmp.is_dir():
         raise PipelineError(f"--tmp is not a directory: {settings.tmp}")
     if settings.figures and not pseudogene_path(settings).is_file():
@@ -470,7 +476,7 @@ def hap_tasks(
                     ]
                 ),
                 outputs=_paths_of,
-                params={"model": call.CLAIR3_MODEL},
+                params={"model": call.model_checksums(call.CLAIR3_MODEL)},
                 encode=_str_or_list,
                 decode=_path_or_list,
             )
@@ -486,7 +492,12 @@ def _call_one(
     """Calls one prepared haplotype; None if it had no reads."""
     if prepared is None:
         return None
-    return call.call_haplotype(prepared.bam.parent, reference, threads=threads)
+    return call.call_haplotype(
+        prepared.bam.parent,
+        reference,
+        threads=threads,
+        model_path=call.CLAIR3_MODEL,
+    )
 
 
 def _merge_annotate_paths(deps: Mapping[str, Any]) -> list[Path]:

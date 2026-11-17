@@ -75,7 +75,7 @@ The figures below come from an ONT run of the public Genome in a Bottle referenc
 
 Requirements: Apptainer (or Docker), a GRCh38 FASTA with `.fai` and `.dict`, and about tens of GB of disk for the data directory.
 
-The image holds open-source tools only (Clair3, Sawfish, minimap2, samtools, bcftools, VEP, BLAST). These cannot be redistributed, so you must obtain them yourself: ANNOVAR (with its `humandb`), InterVar (with `intervardb`), and the profile tables (ClinVar, Taiwan Biobank, HGMD, OMIM genemap2, and the small tables PanelList, DefaultTranscript, Comments, Methylated). Mount ANNOVAR at `/opt/annovar` and InterVar at `/opt/intervar` inside the container.
+The image holds software only (Clair3, Sawfish, minimap2, samtools, bcftools, VEP, BLAST). You obtain the model and the databases yourself: the Clair3 model (step 2), ANNOVAR (with its `humandb`), InterVar (with `intervardb`), and the profile tables (ClinVar, Taiwan Biobank, HGMD, OMIM genemap2, and the small tables PanelList, DefaultTranscript, Comments, Methylated). Mount the model at `/opt/clair3_model`, ANNOVAR at `/opt/annovar` and InterVar at `/opt/intervar` inside the container.
 
 **1. Pull the image.** The image is public on the GitHub Container Registry (GHCR), so no account or token is needed. It is built for linux/amd64.
 
@@ -89,7 +89,30 @@ docker pull ghcr.io/oumarkme/paralog2viewer:0.9.0
 
 The examples below use Apptainer. With Docker, replace `apptainer exec -B a:b paralog2viewer.sif` by `docker run --rm -u "$(id -u):$(id -g)" -v a:b ghcr.io/oumarkme/paralog2viewer:0.9.0`, with one `-v` per mount.
 
-**2. Build the data directory (one time).** `build-data` subsets every annotation source to the Paraphase loci plus padding (default 50 kb), rebuilds the indexes, precomputes RCCX discriminating sites, and writes `manifest.json` with checksums. The first build produced roughly 30 GB.
+**2. Download the Clair3 model (one time).** Calling uses the Clair3 ONT model `r1041_e82_400bps_sup_v520` (20 MB, two files). The model is licensed by Oxford Nanopore for research purposes only, so it is not in the image. Get it from the Clair3 authors' server, or copy it out of the official Clair3 image if that server is slow or unreachable. Both give the same files.
+
+```bash
+mkdir clair3_model && cd clair3_model
+
+# Option A: the Clair3 authors' server (HKU)
+url=https://www.bio8.cs.hku.hk/clair3/clair3_models_rerio_pytorch/r1041_e82_400bps_sup_v520
+curl -fL -O "$url/pileup.pt" -O "$url/full_alignment.pt"
+
+# Option B: the official Clair3 image on Docker Hub
+apptainer exec docker://hkubal/clair3:v2.0.3 \
+  cp /opt/models/r1041_e82_400bps_sup_v520/pileup.pt \
+     /opt/models/r1041_e82_400bps_sup_v520/full_alignment.pt .
+
+# Check the files (both lines must say OK)
+sha256sum -c - <<'SUMS'
+ec73e7fd3d955d8d64efbab29ba81f45c6129774a6c18beecc67c5829611fb4b  pileup.pt
+3d45d34401613df5c4dcd31f3c444e13338a5cb0c8beb395d4f6ab71682f25d3  full_alignment.pt
+SUMS
+```
+
+With Docker, Option B is `docker run --rm -v "$PWD":/out hkubal/clair3:v2.0.3 cp /opt/models/r1041_e82_400bps_sup_v520/pileup.pt /opt/models/r1041_e82_400bps_sup_v520/full_alignment.pt /out/`. A run stops at the start if the model is missing, and logs a warning if the files differ from these checksums.
+
+**3. Build the data directory (one time).** `build-data` subsets every annotation source to the Paraphase loci plus padding (default 50 kb), rebuilds the indexes, precomputes RCCX discriminating sites, and writes `manifest.json` with checksums. The first build produced roughly 30 GB.
 
 ```bash
 apptainer exec \
@@ -108,10 +131,11 @@ apptainer exec \
 
 `--regions` takes one BED file or one or more Paraphase JSON files. The VEP cache root must contain `homo_sapiens_merged/` and `plugins/` (VEP plugin code, `alphamissense/`, `maxentscan/`).
 
-**3. Run a sample.**
+**4. Run a sample.**
 
 ```bash
 apptainer exec \
+  -B /path/to/clair3_model:/opt/clair3_model \
   -B /path/to/annovar:/opt/annovar,/path/to/intervar:/opt/intervar \
   -B /path/to/input,/path/to/data,/path/to/results \
   paralog2viewer.sif paralog2viewer run \
@@ -194,6 +218,7 @@ Written to `<outdir>/<SAMPLE_ID>/`:
 | Calling regions lie outside the data subsets | The data directory was built from other loci. Rebuild with `--regions` that include this sample's JSON, or a larger `--padding`. |
 | Reference or dictionary missing | Give `--reference` a FASTA with `.fai` and `.dict` next to it. Its contigs must match the Paraphase BAM header. |
 | Run failed | The work directory is kept. Start again with `--work-dir <same directory>` to resume. |
+| Clair3 model file not found | The tool looks for `/opt/clair3_model/pileup.pt` and `full_alignment.pt`. Download the model (Quick start, step 2) and add `-B /path/to/clair3_model:/opt/clair3_model`. |
 | ANNOVAR or InterVar not found | The tool looks for `/opt/annovar/table_annovar.pl` and `/opt/intervar/Intervar.py`. Check the `-B` mounts. |
 | Input not accepted | The BAM must end in `.paraphase.bam` (or pass `--sample`) and have `.bai` and `.json` next to it. |
 
@@ -209,7 +234,7 @@ The version lives in the `VERSION` file only. GitHub Actions (`.github/workflows
 
 ## License and third-party tools
 
-paralog2viewer is GPL-3.0-or-later (see `LICENSE`). Third-party tools keep their own licenses. The table lists what web lookups on 2026-11-13 and 2026-11-16 found; "not verified" means no license text could be fetched, so check upstream before redistributing. The image contains Clair3, its ONT model, Sawfish, minimap2, samtools, bcftools, longphase, VEP and BLAST+; it does not contain Paraphase, ANNOVAR, InterVar or any annotation data. The Clair3 ONT model derives from Oxford Nanopore's Rerio models, which are licensed for research purposes only, so the image as a whole is for research use.
+paralog2viewer is GPL-3.0-or-later (see `LICENSE`). Third-party tools keep their own licenses. The table lists what web lookups on 2026-11-13 and 2026-11-16 found; "not verified" means no license text could be fetched, so check upstream before redistributing. The image contains Clair3, Sawfish, minimap2, samtools, bcftools, longphase, VEP and BLAST+; it does not contain the Clair3 model, Paraphase, ANNOVAR, InterVar or any annotation data. The Clair3 ONT model, which you download yourself, derives from Oxford Nanopore's Rerio models and is licensed for research purposes only.
 
 | Tool | Role | License | Citation |
 |---|---|---|---|

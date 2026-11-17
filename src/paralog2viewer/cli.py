@@ -43,6 +43,8 @@ REQUIRED_TOOLS = (
     "python3",
     "/opt/annovar/table_annovar.pl",
     "/opt/intervar/Intervar.py",
+    "/opt/clair3_model/pileup.pt",
+    "/opt/clair3_model/full_alignment.pt",
 )
 
 

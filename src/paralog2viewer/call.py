@@ -17,7 +17,10 @@ Nextflow pipeline.
 from __future__ import annotations
 
 import collections
+import functools
+import hashlib
 import json
+import logging
 import shutil
 import tempfile
 from pathlib import Path
@@ -26,10 +29,47 @@ import pysam
 
 from paralog2viewer.proc import ToolError, run
 
-# Model directory inside the container (same as the old Nextflow pipeline).
-CLAIR3_MODEL = "/opt/models/recall"
+# Clair3 model directory. The model is not in the image: users download it
+# and bind-mount it here (README, "Clair3 model").
+CLAIR3_MODEL = "/opt/clair3_model"
+CLAIR3_MODEL_FILES = ("pileup.pt", "full_alignment.pt")
+# SHA-256 of r1041_e82_400bps_sup_v520 (Clair3 2.0.3), the validated model.
+VALIDATED_MODEL = {
+    "pileup.pt": (
+        "ec73e7fd3d955d8d64efbab29ba81f45c6129774a6c18beecc67c5829611fb4b"
+    ),
+    "full_alignment.pt": (
+        "3d45d34401613df5c4dcd31f3c444e13338a5cb0c8beb395d4f6ab71682f25d3"
+    ),
+}
+
+log = logging.getLogger(__name__)
 
 BASES = frozenset("ACGTN")
+
+
+@functools.cache
+def model_checksums(model_dir: str = CLAIR3_MODEL) -> dict[str, str]:
+    """Returns the SHA-256 of each model file and warns on an unknown model.
+
+    Raises:
+        FileNotFoundError: A model file is missing.
+    """
+    sums = {}
+    for name in CLAIR3_MODEL_FILES:
+        digest = hashlib.sha256()
+        with open(Path(model_dir) / name, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        sums[name] = digest.hexdigest()
+    if sums != VALIDATED_MODEL:
+        log.warning(
+            "Clair3 model in %s is not the validated "
+            "r1041_e82_400bps_sup_v520; calls may differ",
+            model_dir,
+        )
+    return sums
+
 
 # Header lines shared by calls.vcf.gz and the merged VCF.
 FORMAT_LINES = (

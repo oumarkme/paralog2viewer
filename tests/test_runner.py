@@ -97,7 +97,23 @@ class Env:
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    model = tmp_path / "clair3_model"
+    for name in call.CLAIR3_MODEL_FILES:
+        _touch(model / name, name)
+    monkeypatch.setattr(call, "CLAIR3_MODEL", str(model))
     return Env(tmp_path)
+
+
+def test_missing_clair3_model_stops_run(env, monkeypatch):
+    monkeypatch.setattr(call, "CLAIR3_MODEL", str(env.root / "no_model"))
+    with pytest.raises(runner.PipelineError, match="Clair3 model file"):
+        runner.check_inputs(env.settings())
+
+
+def test_unknown_clair3_model_warns(env, caplog):
+    sums = call.model_checksums(call.CLAIR3_MODEL)
+    assert set(sums) == set(call.CLAIR3_MODEL_FILES)
+    assert "not the validated" in caplog.text
 
 
 def install_fakes(monkeypatch, env: Env, *, fail_prepare: str | None = None):
