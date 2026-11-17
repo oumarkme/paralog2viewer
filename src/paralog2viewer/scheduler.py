@@ -12,7 +12,8 @@ Resource limits:
   budget (a counting semaphore of thread weights, kept by the parent).
   Children inherit the CPU affinity of the process; nothing is pinned here.
 * Memory: the sum of ``Task.memory_gb`` estimates of running tasks never
-  exceeds the budget. The numbers are estimates, not measurements.
+  exceeds the budget; a task estimated above the whole budget runs alone.
+  The numbers are estimates, not measurements.
 
 Resume: a finished task leaves ``<markers>/<key>.json`` with a hash of its
 name, input fingerprints (content hash below 1 MiB, otherwise size and mtime),
@@ -494,8 +495,12 @@ class Pool:
                     f"1..{self.threads}"
                 )
             if task.memory_gb > self.max_memory_gb:
-                raise SchedulerError(
-                    f"{task.key}: memory {task.memory_gb} GB above budget"
+                LOGGER.warning(
+                    "%s: estimate %.1f GB exceeds the %.1f GB budget; "
+                    "it runs alone",
+                    task.key,
+                    task.memory_gb,
+                    self.max_memory_gb,
                 )
             by_key[task.key] = task
         for task in tasks:
@@ -643,9 +648,9 @@ class Pool:
                     progressed = True
                     continue
                 state.queued[task.key] = task_hash
-            if (
-                state.used_threads + task.threads > self.threads
-                or state.used_mem + task.memory_gb > self.max_memory_gb
+            if state.used_threads + task.threads > self.threads or (
+                state.used_mem > 0
+                and state.used_mem + task.memory_gb > self.max_memory_gb
             ):
                 continue
             self.marker_path(task.key).unlink(missing_ok=True)

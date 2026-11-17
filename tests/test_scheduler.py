@@ -85,6 +85,20 @@ def test_thread_budget_never_exceeded_and_used(tmp_path):
     assert peak == 4
 
 
+def test_task_above_memory_budget_runs_alone(tmp_path, caplog):
+    log = tmp_path / "log"
+    work = _logger(log)
+    tasks = [Task(f"m{i}", work(f"m{i}", 0.2), memory_gb=6.0) for i in range(2)]
+    _pool(tmp_path, threads=4, max_memory_gb=4.0).run(tasks)
+    events = sorted(_events(log), key=lambda e: e[2])
+    live = peak = 0
+    for kind, _, _ in events:
+        live += 1 if kind == "start" else -1
+        peak = max(peak, live)
+    assert peak == 1 and len(events) == 4
+    assert "runs alone" in caplog.text
+
+
 def test_memory_guard_serializes_heavy_tasks(tmp_path):
     log = tmp_path / "log"
     work = _logger(log)
