@@ -1,6 +1,6 @@
 # paralog2viewer
 
-[![version](https://img.shields.io/badge/version-1.2.0-0072B2)](https://github.com/oumarkme/paralog2viewer/pkgs/container/paralog2viewer)
+[![version](https://img.shields.io/badge/version-1.2.0-0072B2?style=flat)](https://github.com/oumarkme/paralog2viewer/pkgs/container/paralog2viewer)
 [![license](https://img.shields.io/badge/license-GPL--3.0--or--later-009E73)](https://www.gnu.org/licenses/gpl-3.0.html)
 [![container](https://img.shields.io/badge/container-ghcr.io-56B4E9?logo=docker&logoColor=white)](https://github.com/oumarkme/paralog2viewer/pkgs/container/paralog2viewer)
 [![python](https://img.shields.io/badge/python-3.11-E69F00?logo=python&logoColor=white)](https://www.python.org/)
