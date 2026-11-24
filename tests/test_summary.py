@@ -372,6 +372,4 @@ def test_cn_mismatch_counts_as_a_note(tmp_path: Path) -> None:
     for gene in model["genes"]:
         cn = [n for n in gene["notes"] if n.startswith("CN ")]
         assert gene["tiers"].get(("note", "copy number"), 0) == len(cn)
-    assert any(
-        g["tiers"].get(("note", "copy number")) for g in model["genes"]
-    )
+    assert any(g["tiers"].get(("note", "copy number")) for g in model["genes"])

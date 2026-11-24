@@ -934,7 +934,9 @@ def classify_rccx(
                 position = "proximal"
             tied = n_distal if is_distal(hap) else n_mod - n_distal
             first_slot = order - sum(
-                1 for h in ordered[: order - 1] if is_distal(h) == is_distal(hap)
+                1
+                for h in ordered[: order - 1]
+                if is_distal(h) == is_distal(hap)
             )
             slots = (
                 str(order)
@@ -1118,7 +1120,8 @@ def _table_cells(
         str(row["allele"]) if first else "",
         str(row["allele_tag"]) if first else "",
         str(row["structure"]) if first else "",
-        str(row["hap"]) + (" \u2020" if row["assignment"] == "inferred" else ""),
+        str(row["hap"])
+        + (" \u2020" if row["assignment"] == "inferred" else ""),
         _module_text(row),
         fam_text("RP"),
         fam_text("C4"),

@@ -352,10 +352,7 @@ def build_model(
         key=lambda g: (
             -_n(g, "P"),
             -_n(g, "LP"),
-            -(
-                _n(g, "note")
-                + sum(not n.startswith("CN ") for n in g["notes"])
-            ),
+            -(_n(g, "note") + sum(not n.startswith("CN ") for n in g["notes"])),
             g["name"],
         ),
     )
@@ -496,7 +493,9 @@ button.t{cursor:pointer}button.t[aria-pressed=true]{outline:2px solid var(--fg);
 outline-offset:1px}
 .t.P{background:#CC0000;color:#fff}.t.LP{background:#E69F00}.t.note{background:#F0E442}
 td.fl,td.nw{white-space:nowrap}th.cg{width:11rem}th.cf{width:12rem}
-th.cn{width:8rem}td.fi{color:var(--fg)}tr.g.none td{color:var(--mut)}tr.g.none td.red{color:var(--red)}tr.g{cursor:pointer}tr.g:hover{background:var(--card)}
+th.cn{width:8rem}td.fi{color:var(--fg)}tr.g.none td{color:var(--mut)}
+tr.g.none td.red{color:var(--red)}
+tr.g{cursor:pointer}tr.g:hover{background:var(--card)}
 tr.d>td{background:var(--card);padding:.4rem .6rem}
 .ok{--c:var(--ok)}.review{--c:var(--review)}.problem{--c:var(--problem)}
 .info{--c:var(--info)}
@@ -588,9 +587,7 @@ def _tier_counts(counter: Mapping[tuple[str, str], int]) -> dict[str, int]:
 
 def _role_text(counter: Mapping[tuple[str, str], int], tier: str) -> str:
     parts = [
-        f"{n} {role}"
-        for role in ROLES
-        if (n := counter.get((tier, role), 0))
+        f"{n} {role}" for role in ROLES if (n := counter.get((tier, role), 0))
     ]
     return ", ".join(parts)
 
@@ -757,9 +754,9 @@ def _gene_rows(index: int, gene: Mapping) -> str:
         f'<tr class="g{"" if gene["flagged"] else " none"}" '
         f'data-tiers="{_tiers_attr(gene)}">'
         f"<td>{problem}<strong>{_e(gene['name'])}</strong></td>"
-        f"<td class=\"fl\">{_tags(gene['tiers'])}</td>"
-        f"<td class=\"fi\">{_e(_findings(gene))}</td>"
-        f"<td class=\"n\">{cn_pill}</td>"
+        f'<td class="fl">{_tags(gene["tiers"])}</td>'
+        f'<td class="fi">{_e(_findings(gene))}</td>'
+        f'<td class="n">{cn_pill}</td>'
         f"{_cell(gene['variants'], cls='n')}</tr>"
         f'<tr class="d" hidden><td colspan="5">{"".join(body)}</td></tr>'
     )
