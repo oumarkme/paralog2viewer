@@ -10,6 +10,7 @@ from paralog2viewer import config
 def test_parse_formats_both_and_single():
     assert config.parse_formats("vcf,mviewer") == ("vcf", "mviewer")
     assert config.parse_formats("MViewer") == ("mviewer",)
+    assert config.parse_formats("vcf,Summary") == ("vcf", "summary")
 
 
 def test_parse_formats_dedup_keeps_order():

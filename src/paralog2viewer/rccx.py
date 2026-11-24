@@ -39,7 +39,7 @@ import json
 import os
 import tempfile
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import astuple, dataclass
 from importlib import resources
 from pathlib import Path
@@ -52,7 +52,7 @@ from matplotlib import pyplot as plt  # noqa: E402
 from matplotlib.patches import Patch, Rectangle  # noqa: E402
 
 from paralog2viewer import proc  # noqa: E402
-from paralog2viewer.figstyle import FONT_PT, base_rc  # noqa: E402
+from paralog2viewer.figstyle import FIGURE_DPI, FONT_PT, base_rc  # noqa: E402
 
 BLASTN_PARAMS = ("-task", "blastn", "-dust", "no", "-evalue", "1e-20")
 SITE_COLUMNS = (
@@ -716,6 +716,80 @@ def _prefix(family: str) -> str:
     return "cyp21_blast" if family == "CYP21" else family.lower()
 
 
+def cyp21_symbols(
+    paraphase_json: Path,
+    genes_tsv: Path | None = None,
+    region_key: str = "rccx",
+) -> dict[str, str]:
+    """Return HP -> CYP21 gene name of each RCCX haplotype.
+
+    Same rule as ``cyp21_paraphase`` of ``classify_rccx``: the proximal
+    gene when Paraphase lists marker hits for the haplotype, else the
+    distal gene.
+
+    Args:
+        paraphase_json: Paraphase JSON with the ``region_key`` entry.
+        genes_tsv: Gene table; the packaged one when None.
+        region_key: Key of the RCCX region.
+
+    Returns:
+        Empty dict if the region is absent.
+    """
+    with open(paraphase_json, encoding="utf-8") as handle:
+        region = json.load(handle).get(region_key)
+    if not region:
+        return {}
+    prox, dist = load_gene_table(genes_tsv).pair("CYP21")
+    return {
+        hap: prox.name if markers else dist.name
+        for hap, markers in region["hap_variants"].items()
+    }
+
+
+def _infer_unlinked(
+    groups: list[list[str]],
+    pool: list[str],
+    is_distal: Callable[[str], bool],
+) -> tuple[list[list[str]], set[str], list[str]]:
+    """Place haplotypes that Paraphase did not link to an allele.
+
+    Every chromosome carries exactly one distal-end module (CYP21A2 with
+    TNXB). An unlinked distal haplotype therefore belongs to the one
+    allele that still lacks a distal end. Unlinked proximal haplotypes
+    cannot be placed by this rule: either allele could carry them.
+
+    Args:
+        groups: Alleles listed by Paraphase (lists of haplotype names).
+        pool: Haplotypes in no listed allele.
+        is_distal: True for a haplotype that is a distal-end module.
+
+    Returns:
+        (alleles with the placed haplotypes added, placed haplotypes,
+        haplotypes that stay unlinked).
+    """
+    alleles = [list(g) for g in groups]
+    pool_d = [h for h in pool if is_distal(h)]
+    pool_p = [h for h in pool if not is_distal(h)]
+    placed: set[str] = set()
+    if len(alleles) == 2 and len(pool_d) == 1:
+        lacking = [a for a in alleles if not any(is_distal(h) for h in a)]
+        if len(lacking) == 1:
+            lacking[0].append(pool_d[0])
+            placed.add(pool_d[0])
+            pool_d = []
+    elif (
+        len(alleles) == 1
+        and len(pool_d) == 1
+        and not pool_p
+        and any(is_distal(h) for h in alleles[0])
+    ):
+        # One linked allele with its distal end, one lone distal module.
+        alleles.append([pool_d[0]])
+        placed.add(pool_d[0])
+        pool_d = []
+    return alleles, placed, pool_d + pool_p
+
+
 def classify_rccx(
     paraphase_json: Path,
     merged_vcf: Path,
@@ -751,7 +825,9 @@ def classify_rccx(
     Returns:
         One dict per haplotype, ordered by allele and then by module
         position (proximal first): allele, allele_tag, n_modules,
-        structure, deleted_modules, module_position, hap,
+        structure, deleted_modules, module_position, module_order
+        (5' to 3' slot, a range for modules of one type whose order is
+        not resolved), assignment (paraphase, inferred or unlinked), hap,
         cyp21_paraphase (CYP21A1P or CYP21A2), cyp21_marker_hits,
         coverage_source (bam or vcf) and, per family prefix (rp, c4,
         cyp21_blast, tnx), ``<prefix>_call``, ``_gene`` (resolved gene or
@@ -827,25 +903,44 @@ def classify_rccx(
         for hap in group:
             if hap not in details:
                 raise ValueError(f"allele lists unknown haplotype {hap!r}")
-    groups = [list(g) for g in listed_groups]
     tags = list(region.get("annotated_alleles") or [])
-    assigned = {h for g in groups for h in g}
-    groups += [[h] for h in haps if h not in assigned]
+    assigned = {h for g in listed_groups for h in g}
+    pool = [h for h in haps if h not in assigned]
+
+    def is_distal(hap: str) -> bool:
+        return cyp21_gene(hap) != cyp_prox.name
+
+    groups, placed, leftover = _infer_unlinked(
+        [list(g) for g in listed_groups], pool, is_distal
+    )
+    n_listed = len(groups)
+    groups += [[h] for h in leftover]
     rows: list[dict[str, object]] = []
     for index, group in enumerate(groups):
-        listed = index < len(listed_groups)
-        ordered = sorted(
-            group, key=lambda h: 0 if cyp21_gene(h) == cyp_prox.name else 1
-        )
+        listed = index < n_listed
+        # Chromosome order, 5' to 3': proximal modules (CYP21A1P side),
+        # then the distal end (CYP21A2 with TNXB). Modules of one type keep
+        # the Paraphase order; their mutual order is not resolved.
+        ordered = sorted(group, key=is_distal)
         n_mod = len(group)
-        for hap in ordered:
+        n_distal = sum(1 for h in group if is_distal(h))
+        for order, hap in enumerate(ordered, start=1):
             lo_b, hi_b = details[hap]["boundary"]
             if n_mod == 1 and listed:
                 position = "sole"
-            elif cyp21_gene(hap) == cyp_prox.name:
-                position = "proximal"
-            else:
+            elif is_distal(hap):
                 position = "distal"
+            else:
+                position = "proximal"
+            tied = n_distal if is_distal(hap) else n_mod - n_distal
+            first_slot = order - sum(
+                1 for h in ordered[: order - 1] if is_distal(h) == is_distal(hap)
+            )
+            slots = (
+                str(order)
+                if tied == 1 or not listed
+                else f"{first_slot}-{first_slot + tied - 1}"
+            )
             row: dict[str, object] = {
                 "allele": index + 1,
                 "allele_tag": tags[index]
@@ -861,6 +956,14 @@ def classify_rccx(
                 if listed
                 else "",
                 "module_position": position,
+                "module_order": slots if listed else "",
+                "assignment": (
+                    "inferred"
+                    if hap in placed
+                    else "paraphase"
+                    if listed
+                    else "unlinked"
+                ),
                 "hap": hap,
                 "cyp21_paraphase": cyp21_gene(hap),
                 "cyp21_marker_hits": len(region["hap_variants"][hap]),
@@ -981,6 +1084,14 @@ def _conflict(row: Mapping[str, object]) -> bool:
     return bool(gene) and gene != str(row["cyp21_paraphase"])
 
 
+def _module_text(row: Mapping[str, object]) -> str:
+    """Return "<order>/<n> <position>", for example "1-2/3 proximal"."""
+    order = str(row.get("module_order", ""))
+    if not order or row["module_position"] == "sole":
+        return str(row["module_position"])
+    return f"{order}/{row['n_modules']} {row['module_position']}"
+
+
 def _table_cells(
     row: Mapping[str, object], table: GeneTable, first: bool
 ) -> list[str]:
@@ -1007,8 +1118,8 @@ def _table_cells(
         str(row["allele"]) if first else "",
         str(row["allele_tag"]) if first else "",
         str(row["structure"]) if first else "",
-        str(row["hap"]),
-        str(row["module_position"]),
+        str(row["hap"]) + (" \u2020" if row["assignment"] == "inferred" else ""),
+        _module_text(row),
         fam_text("RP"),
         fam_text("C4"),
         cyp,
@@ -1122,15 +1233,15 @@ def _build_figure(
     ) / (slots * n_boxes)
     schema_h = head_h + len(alleles) * row_h
     table_h = cell_h * (len(rows) + 1)
-    legend_h = 6 * 3.2 + 2.0
+    legend_h = 8.3 * 3.2 + 2.0
     height = 2.0 + schema_h + gap + table_h + gap + legend_h + 1.0
     if height > MAX_HEIGHT_MM:
         raise ValueError(
             f"figure would be {height:.0f} mm high "
             f"(limit {MAX_HEIGHT_MM:.0f} mm)"
         )
-    # Whole pixels at 300 dpi, so the JPEG is exactly 180 mm (2126 px).
-    width_in = round(WIDTH_MM / MM * 300) / 300
+    # Whole pixels, so the JPEG is exactly 180 mm (1063 px at 150 dpi).
+    width_in = round(WIDTH_MM / MM * FIGURE_DPI) / FIGURE_DPI
     fig = plt.figure(figsize=(width_in, height / MM))
     fig.set_facecolor("white")
 
@@ -1322,7 +1433,13 @@ def _build_figure(
         "distal-like (% of covered sites matching the named gene), exactly "
         "50 % = mixed; CYP21 BLAST: anything else = mixed. chimeric = "
         "opposite majorities\n(>= 65 %, >= 5 sites per half); n.d. = fewer "
-        "than 3 sites. CYP21: Paraphase marker hits / BLAST vote.",
+        "than 3 sites. CYP21: Paraphase marker hits / BLAST vote.\n"
+        "Module = slot 5' to 3' / modules in the allele; a range = same-type "
+        "modules, order not resolved.\n\u2020 = haplotype not linked by "
+        "Paraphase, placed on the allele that lacked a distal (CYP21A2) "
+        "end.\n"
+        "In-house pipeline: types are voted by paralog2viewer, not taken "
+        "from the Paraphase result.",
         ha="left",
         va="bottom",
         linespacing=1.3,
@@ -1342,7 +1459,7 @@ def plot_rccx_module(
     boxes RP, C4, CYP21, TNX colored by the resolved gene, hatched when
     chimeric or mixed, dashed when not determined; a dashed placeholder
     for a deleted module), then a table with one row per haplotype.
-    JPEG, 300 dpi, quality 95, 180 mm wide, Liberation Sans 7 pt (DejaVu
+    JPEG, 150 dpi, quality 95, 180 mm wide, Liberation Sans 7 pt (DejaVu
     Sans if missing), Okabe-Ito colors.
 
     Args:
@@ -1365,8 +1482,8 @@ def plot_rccx_module(
         fig.savefig(
             out_path,
             format="jpeg",
-            dpi=300,
-            pil_kwargs={"quality": 95, "dpi": (300, 300)},
+            dpi=FIGURE_DPI,
+            pil_kwargs={"quality": 95, "dpi": (FIGURE_DPI, FIGURE_DPI)},
         )
         plt.close(fig)
     return out_path

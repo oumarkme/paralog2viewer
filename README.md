@@ -1,6 +1,6 @@
 # paralog2viewer
 
-[![version](https://img.shields.io/badge/version-0.9.0-0072B2)](https://github.com/oumarkme/paralog2viewer/pkgs/container/paralog2viewer)
+[![version](https://img.shields.io/badge/version-1.0.0-0072B2)](https://github.com/oumarkme/paralog2viewer/pkgs/container/paralog2viewer)
 [![license](https://img.shields.io/badge/license-GPL--3.0--or--later-009E73)](https://www.gnu.org/licenses/gpl-3.0.html)
 [![container](https://img.shields.io/badge/container-ghcr.io-56B4E9?logo=docker&logoColor=white)](https://github.com/oumarkme/paralog2viewer/pkgs/container/paralog2viewer)
 [![python](https://img.shields.io/badge/python-3.11-E69F00?logo=python&logoColor=white)](https://www.python.org/)
@@ -8,9 +8,9 @@
 
 Per-haplotype variant calls, annotation, and read-pileup figures for paralogous genes, starting from an Oxford Nanopore (ONT) Paraphase result.
 
-Version 0.9.0 (pre-release). License GPL-3.0-or-later. Research use only, not a clinical diagnostic.
+Version 1.0.0. License GPL-3.0-or-later. Research use only, not a clinical diagnostic.
 
-For each sample you get one annotated variant call format (VCF) file, one 365-column MViewer-format table, and one figure per gene region. A figure shows every read of a region as one row, grouped by haplotype (`HP` tag). Colored dots mark alleles that some haplotypes carry and others do not. White diamonds mark ClinVar or InterVar Pathogenic and Likely pathogenic alleles. Black squares mark pseudogene-type alleles from a curated table. For the RCCX region (RP-C4-CYP21-TNX modules), a second figure shows the module structure and the gene-conversion call per haplotype.
+For each sample you get one annotated variant call format (VCF) file, one 365-column MViewer-format table, one figure per gene region, and a one-page HTML summary. A figure shows every read of a region as one row, grouped by haplotype (`HP` tag). Colored dots mark alleles that some haplotypes carry and others do not. White diamonds mark ClinVar or InterVar Pathogenic and Likely pathogenic alleles. Black squares mark pseudogene-type alleles from a curated table. For the RCCX region (RP-C4-CYP21-TNX modules), a second figure shows the module structure and the gene-conversion call per haplotype.
 
 ## What it does
 
@@ -154,10 +154,13 @@ Written to `<outdir>/<SAMPLE_ID>/`:
 |---|---|
 | `{SAMPLE_ID}.paralog.vcf.gz`, `.tbi` | Merged, annotated VCF, one sample column per `HP` value |
 | `{SAMPLE_ID}.paralog.tsv.gz` | 365-column MViewer-format table |
-| `figures/` | Read-pileup JPEG per region (`<region>.jpeg`), or one per locus named `<region>_<SYMBOL>.jpeg` (for example `pms2_PMS2.jpeg`, `pms2_PMS2CL.jpeg`) when a region has haplotypes projected to different loci; RCCX module figure |
+| `paralog2viewer_summary.html` | Self-contained summary page: tier bar (for example 3 P / 2 LP / 1 note), gene table with one column per tier (P, LP, note) and locus role (gene, pseudogene, unresolved, ...), filter chips, per-gene fold with flagged variants and figures (embedded, each with a Download link), RCCX section (notices and the module figure, always shown, no table). Works offline |
+| `figures/` | Written only when `summary` is not in `--format` (or the page could not be written); the summary page embeds every figure with a Download link, so the default run has no `figures/` folder. Read-pileup JPEG (150 dpi, 180 mm wide) per region (`<region>.jpeg`), or one per locus named `<region>_<SYMBOL>.jpeg` (for example `pms2_PMS2.jpeg`, `pms2_PMS2CL.jpeg`) when a region has haplotypes projected to different loci; RCCX module figure |
 | `timings.tsv` | Wall time, CPU time, and peak memory per step |
 
-`--format vcf,mviewer` (default) writes both. `--format vcf` or `--format mviewer` writes one. Annotation runs in every case; a single-format run skips only the file writing. `--no-figures` skips plotting.
+`--format vcf,mviewer,summary` (default) writes all three. A shorter list writes only the listed files. Annotation runs in every case; a shorter list skips only the file writing. A summary error is logged and never fails the run. `--no-figures` skips plotting.
+
+Summary flags (thresholds are constants in `summary.py` and printed in the page footer): ClinVar or InterVar Pathogenic/Likely pathogenic; a known gene/pseudogene variant (`known_gene_pseudogene_variants.tsv`) with identical chrom, pos, REF and ALT on a haplotype that has the functional gene's role (RCCX: CYP21 gene of the haplotype; copies with no role rows, such as NCF1, are not flagged); high-impact consequence (frameshift, stop gained, start lost, splice donor/acceptor) with Max Allele Freq < 1%; VUS with REVEL > 0.7 or CADD_phred > 25 and Max Allele Freq < 1%. Red text marks anything to check. Each flagged variant is a P (red), LP (orange) or note (yellow) by the higher of its ClinVar and InterVar class; every other flag is a note. Counts are per haplotype: a variant on three haplotypes counts three times, under the locus role of each carrying haplotype. Genes without haplotypes are listed in one fold; PROBLEM marks a failed or aborted step. CN compares resolved haplotypes (two-copy haplotypes counted twice) with Paraphase `total_cn`.
 
 `SAMPLE_ID` is the BAM file name without `.paraphase.bam`. The BAM must end in `.paraphase.bam` unless you pass `--sample`.
 
@@ -174,7 +177,7 @@ Written to `<outdir>/<SAMPLE_ID>/`:
 | `--work-dir` | none | Reuse this work directory to resume a run (never deleted) |
 | `--resume`, `--no-resume` | resume on | Skip steps with a valid done-marker |
 | `--cache` | `<data>/annotation_cache.sqlite` | Annotation cache, keyed by allele and data manifest checksum |
-| `--format` | `vcf,mviewer` | Comma list of output formats |
+| `--format` | `vcf,mviewer,summary` | Comma list of output formats |
 | `--figures`, `--no-figures` | figures on | Draw figures |
 | `--vcf-annotation` | `default` | `full` also adds selected ANNOVAR fields to the VCF |
 | `--pseudogene-tsv` | table shipped with the package | Pseudogene allele table |
@@ -199,7 +202,7 @@ Written to `<outdir>/<SAMPLE_ID>/`:
 ## RCCX notes
 
 - Variants come from the same Clair3 and Sawfish path as every other gene.
-- The module call (C4A/C4B, TNXA/TNXB, WHR1/WHR1B by a vote over precomputed BLAST sites; CYP21A2 versus CYP21A1P from Paraphase marker hits) depends on Paraphase phasing. If Paraphase phasing failed, alleles show as `unassigned`.
+- The module call (C4A/C4B, TNXA/TNXB, WHR1/WHR1B by a vote over precomputed BLAST sites; CYP21A2 versus CYP21A1P from Paraphase marker hits) depends on Paraphase phasing. The RCCX section is the in-house module of this tool, not the Paraphase result (the summary page and the figure say so). A haplotype that Paraphase left unlinked is placed on the allele that lacks a distal (CYP21A2) end, so a 2 + 3 module sample reads bimodular + trimodular; modules are ordered 5' to 3' by type and same-type neighbours show a range. Order inside a same-type pair is not resolved (junction reads are not used yet). A haplotype that cannot be placed stays `unassigned`.
 - The calls have had no clinical-geneticist review on a known CYP21A2 chimera. Treat them as research output.
 
 ## Resources and speed

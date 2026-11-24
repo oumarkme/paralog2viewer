@@ -112,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="formats",
         type=_formats,
         default=config.VALID_FORMATS,
-        help="comma list of vcf,mviewer (default: vcf,mviewer)",
+        help="comma list of vcf,mviewer,summary (default: all three)",
     )
     run.add_argument(
         "--figures",

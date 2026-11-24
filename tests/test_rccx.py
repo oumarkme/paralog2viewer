@@ -601,9 +601,9 @@ def test_figure_geometry_and_legibility(calls, tmp_path: Path):
     out = rccx.plot_rccx_module(calls, tmp_path / "figures" / "m.jpeg")
     with Image.open(out) as img:
         assert img.format == "JPEG"
-        assert round(img.info["dpi"][0]) == 300
-        assert img.width == round(rccx.WIDTH_MM / rccx.MM * 300)
-        assert img.height / 300 * rccx.MM <= rccx.MAX_HEIGHT_MM
+        assert round(img.info["dpi"][0]) == 150
+        assert img.width == round(rccx.WIDTH_MM / rccx.MM * 150)
+        assert img.height / 150 * rccx.MM <= rccx.MAX_HEIGHT_MM
 
     table = rccx.load_gene_table()
     with rccx.plt.rc_context(rccx._set_font()):
@@ -801,3 +801,66 @@ def test_failed_haplotype_is_not_determined_not_distal(
     assert gone["c4_call"] == "not_determined"
     assert gone["c4_n_informative"] == 0
     assert _by_hap(rows)["h_dist"]["c4_call"] == "distal_type"
+
+
+def test_cyp21_symbols_follow_the_marker_hits(tmp_path: Path):
+    path = tmp_path / "p.json"
+    path.write_text('{"rccx": {"hap_variants": {"h1": ["m1"], "h2": []}}}')
+    prox, dist = rccx.load_gene_table().pair("CYP21")
+    assert rccx.cyp21_symbols(path) == {"h1": prox.name, "h2": dist.name}
+    assert prox.name != dist.name
+    path.write_text("{}")
+    assert rccx.cyp21_symbols(path) == {}
+
+
+def _is_distal(hap: str) -> bool:
+    return hap in {"d1", "d2", "d3"}
+
+
+def test_unlinked_distal_module_joins_the_allele_without_a_distal_end():
+    # 2 + 3 module pattern: bimodular (p4 + d1) and two proximal modules
+    # with the lone distal module unlinked -> 2 + 3 modules.
+    groups, placed, left = rccx._infer_unlinked(
+        [["p4", "d1"], ["p2", "p5"]], ["d3"], _is_distal
+    )
+    assert groups == [["p4", "d1"], ["p2", "p5", "d3"]]
+    assert placed == {"d3"} and left == []
+
+
+def test_unlinked_modules_stay_unlinked_when_ambiguous():
+    # Both alleles already have a distal end: nothing to decide on.
+    groups, placed, left = rccx._infer_unlinked(
+        [["p1", "d1"], ["p2", "d2"]], ["d3"], _is_distal
+    )
+    assert placed == set() and left == ["d3"] and len(groups) == 2
+    # An unlinked proximal module could sit on either allele.
+    _g, placed, left = rccx._infer_unlinked(
+        [["p1", "d1"], ["p2"]], ["p3"], _is_distal
+    )
+    assert placed == set() and left == ["p3"]
+
+
+def test_one_linked_allele_and_a_lone_distal_module_make_two_alleles():
+    groups, placed, left = rccx._infer_unlinked(
+        [["p1", "d1"]], ["d2"], _is_distal
+    )
+    assert groups == [["p1", "d1"], ["d2"]] and placed == {"d2"}
+    assert left == []
+
+
+def test_module_text_shows_order_and_tied_range():
+    row = {"module_order": "1-2", "n_modules": 3, "module_position": "proximal"}
+    assert rccx._module_text(row) == "1-2/3 proximal"
+    row = {"module_order": "3", "n_modules": 3, "module_position": "distal"}
+    assert rccx._module_text(row) == "3/3 distal"
+    row = {"module_order": "1", "n_modules": 1, "module_position": "sole"}
+    assert rccx._module_text(row) == "sole"
+
+
+def test_rows_carry_module_order_and_assignment(calls):
+    by = _by_hap(calls)
+    assert (by["g_hap1"]["module_order"], by["g_hap2"]["module_order"]) == (
+        "1",
+        "2",
+    )
+    assert by["g_hap1"]["assignment"] == "paraphase"

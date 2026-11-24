@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 DATA_ENV_VAR = "PARALOG2VIEWER_DATA"
-VALID_FORMATS = ("vcf", "mviewer")
+VALID_FORMATS = ("vcf", "mviewer", "summary")
 VCF_ANNOTATION_MODES = ("default", "full")
 # Share of the available memory used when --memory is not given.
 MEMORY_FRACTION = 0.8
@@ -21,7 +21,7 @@ def parse_formats(text: str) -> tuple[str, ...]:
     """Parses a comma-separated output format list.
 
     Args:
-      text: For example "vcf,mviewer". Case and spaces are ignored.
+      text: For example "vcf,mviewer,summary". Case and spaces are ignored.
 
     Returns:
       Unique formats in the order given.
@@ -31,7 +31,9 @@ def parse_formats(text: str) -> tuple[str, ...]:
     """
     items = [x.strip().lower() for x in text.split(",") if x.strip()]
     if not items:
-        raise ValueError("--format needs at least one of: vcf, mviewer")
+        raise ValueError(
+            f"--format needs at least one of: {', '.join(VALID_FORMATS)}"
+        )
     bad = [x for x in items if x not in VALID_FORMATS]
     if bad:
         raise ValueError(
@@ -140,7 +142,7 @@ class RunSettings:
         tmp: Scratch parent; the run makes its own subdirectory in it.
         work_dir: Existing or new work directory to reuse for resuming; it
             is never deleted by the run (overrides the ``tmp`` subdirectory).
-        formats: Output formats (``vcf``, ``mviewer``).
+        formats: Output formats (``vcf``, ``mviewer``, ``summary``).
         figures: Draw figures.
         threads: Maximum CPU threads; None uses every CPU in the affinity.
         memory_gb: Maximum memory in GB; None uses 80% of the available.

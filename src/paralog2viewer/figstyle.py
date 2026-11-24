@@ -9,6 +9,8 @@ from matplotlib import font_manager
 
 # Text size of all figures; 7 pt is the lab minimum for figure text.
 FONT_PT = 7
+# Figure resolution; the HTML summary embeds the files as written.
+FIGURE_DPI = 150
 
 
 @functools.cache

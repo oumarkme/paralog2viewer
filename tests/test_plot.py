@@ -92,7 +92,7 @@ def data(tmp_path: Path) -> dict:
     known.write_text(
         "# comment\n"
         + KNOWN_HEADER
-        + f"G\tP\tNM_1\tc.1A>C\tG c.1A>C\tchr1\t{pos}\t{REF_SEQ[pos - 1]}"
+        + f"R\tP\tNM_1\tc.1A>C\tG c.1A>C\tchr1\t{pos}\t{REF_SEQ[pos - 1]}"
         f"\t{_alt_base(pos)}\tparalog-specific site\tPMID:1\n"
     )
     # R_hap1: ref. R_hap2: alt at 500 (P/LP), 600 (shared with hap1 as
@@ -145,9 +145,9 @@ def test_figures_named_per_region_and_locus(data: dict) -> None:
     ]
     with Image.open(paths[0]) as img:
         assert img.format == "JPEG"
-        assert img.info["dpi"][0] == pytest.approx(300, abs=1)
-        assert abs(img.size[0] - 180 / 25.4 * 300) <= 1
-        assert img.size[1] / 300 * 25.4 <= 247.0
+        assert img.info["dpi"][0] == pytest.approx(150, abs=1)
+        assert abs(img.size[0] - 180 / 25.4 * 150) <= 1
+        assert img.size[1] / 150 * 25.4 <= 247.0
 
 
 def test_read_hits_follow_the_rules(data: dict) -> None:
@@ -283,6 +283,7 @@ def test_single_haplotype_marks_only_the_known_site(
         data["known"],
         data["fa"],
         data["out"],
+        hap_symbols={"R_hap2": "R"},
     )
     assert markers == {"s"}
 
@@ -472,8 +473,8 @@ def test_figure_height_is_bounded_with_many_haplotypes(tmp_path: Path) -> None:
         max_reads=25,
     )
     with Image.open(out[0]) as img:
-        assert img.size[1] / 300 * 25.4 <= 247.0 + 0.1
-        assert abs(img.size[0] - 180 / 25.4 * 300) <= 1
+        assert img.size[1] / 150 * 25.4 <= 247.0 + 0.1
+        assert abs(img.size[0] - 180 / 25.4 * 150) <= 1
 
 
 def _loci(haps: list[list[str]]) -> list[dict]:
@@ -546,3 +547,146 @@ def test_same_role_haplotypes_are_colored_by_carrier(
     assert plot.HAP_COLORS[0] in colors
     assert plot.HAP_COLORS[1] in colors
     assert plot.ROLE_COLOR["gene"] not in colors
+
+
+# ------------------------------------------------- known-variant hits
+
+
+def _allele(pos: int, ref: str, alt: str, *haps: str) -> plot.Allele:
+    return plot.Allele(
+        "chr1", pos, pos + len(ref) - 1, ref, alt, False, frozenset(haps)
+    )
+
+
+def _known_row(gene: str, pos: int, ref: str, alt: str) -> dict[str, str]:
+    return {
+        "functional_gene": gene,
+        "hgvs": "c.1A>C",
+        "label": f"{gene} site",
+        "chrom": "chr1",
+        "pos": str(pos),
+        "ref": ref,
+        "alt": alt,
+        "reference": "PMID:1",
+    }
+
+
+def test_known_hit_needs_carrier_of_the_functional_gene() -> None:
+    rows = [_known_row("SMN1", 100, "C", "T")]
+    # SMN1 haplotype carries it: hit with all eight fields.
+    carrier = [_allele(100, "C", "T", "smn1_smn1hap1", "smn1_smn2hap1")]
+    assert plot.known_hits(rows, carrier) == [
+        ("SMN1", "chr1", 100, "C", "T", "SMN1 site", "c.1A>C", "PMID:1")
+    ]
+    # Only the paralog haplotype carries it: not a hit.
+    assert (
+        plot.known_hits(rows, [_allele(100, "C", "T", "smn1_smn2hap1")]) == []
+    )
+    # Nobody carries it, or REF/ALT/pos differ: not a hit.
+    assert plot.known_hits(rows, []) == []
+    for other in (
+        _allele(100, "C", "G", "smn1_smn1hap1"),
+        _allele(100, "A", "T", "smn1_smn1hap1"),
+        _allele(101, "C", "T", "smn1_smn1hap1"),
+    ):
+        assert plot.known_hits(rows, [other]) == []
+
+
+def test_known_hit_indel_is_matched_on_the_full_allele() -> None:
+    rows = [_known_row("PMS2", 100, "GGT", "G")]
+    hit = _allele(100, "GGT", "G", "pms2_pms2hap1")
+    assert len(plot.known_hits(rows, [hit])) == 1
+    short = _allele(100, "GG", "G", "pms2_pms2hap1")
+    assert plot.known_hits(rows, [short]) == []
+
+
+def test_known_hit_needs_a_resolved_gene_role_or_a_given_symbol() -> None:
+    # No role rows for NCF1: copies cannot be told apart, so no hit.
+    rows = [_known_row("NCF1", 100, "GGT", "G")]
+    alleles = [_allele(100, "GGT", "G", "ncf1_hap1", "ncf1_hap2")]
+    assert plot.known_hits(rows, alleles) == []
+    # A pseudogene-role haplotype never counts as the functional gene.
+    pms2 = [_known_row("PMS2CL", 100, "C", "T")]
+    assert (
+        plot.known_hits(pms2, [_allele(100, "C", "T", "pms2_pms2clhap1")]) == []
+    )
+    # RCCX: symbols come from the caller (CYP21 gene of each haplotype).
+    cyp = [_known_row("CYP21A2", 100, "C", "T")]
+    allele = [_allele(100, "C", "T", "rccx_hap1", "rccx_hap2")]
+    assert plot.known_hits(cyp, allele) == []
+    hits = plot.known_hits(
+        cyp, allele, hap_symbols={"rccx_hap1": "CYP21A2", "rccx_hap2": "X"}
+    )
+    assert [h[0] for h in hits] == ["CYP21A2"]
+
+
+def test_known_markers_only_on_carriers_with_indel_span(
+    data: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    carrier = [_allele(100, "GGT", "G", "R_hap2")]
+    found = plot._known_carriers(
+        [_known_row("R", 100, "GGT", "G")],
+        carrier,
+        None,
+        None,
+        {"R_hap2": "R"},
+    )
+    ((_, allele, haps),) = found
+    assert haps == {"R_hap2"}
+    # Span of a left-anchored deletion covers the REF bases, not the anchor.
+    assert (allele.pos, allele.end) == (100, 102)
+    # R_hap1 alone does not carry the site: no square marker at all.
+    markers = set()
+    original = Axes.scatter
+
+    def spy(self, x, y, *args, **kwargs):  # noqa: ANN001
+        markers.add(kwargs["marker"])
+        return original(self, x, y, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "scatter", spy)
+    plot.plot_regions(
+        data["vcf"],
+        {"R_hap1": data["dirs"]["R_hap1"]},
+        set(),
+        data["known"],
+        data["fa"],
+        data["out"],
+    )
+    assert "s" not in markers
+
+
+def test_read_known_reports_a_missing_column(tmp_path: Path) -> None:
+    path = tmp_path / "k.tsv"
+    path.write_text("functional_gene\tchrom\tpos\tref\talt\tlabel\n")
+    with pytest.raises(ValueError, match="hgvs.*reference|reference.*hgvs"):
+        plot.read_known(path)
+    path.write_text(KNOWN_HEADER + "G\tP\tn\th\tl\tchr1\tx\tA\tC\te\tPMID:1\n")
+    with pytest.raises(ValueError, match="pos"):
+        plot.read_known(path)
+
+
+def test_packaged_known_file_is_readable_and_every_row_can_hit() -> None:
+    path = plot.RESOURCES / "known_gene_pseudogene_variants.tsv"
+    rows = plot.read_known(path)
+    assert rows
+    alleles = [
+        plot.Allele(
+            r["chrom"],
+            int(r["pos"]),
+            int(r["pos"]) + len(r["ref"]) - 1,
+            r["ref"],
+            r["alt"],
+            False,
+            frozenset({f"{r['functional_gene']}_hap1"}),
+        )
+        for r in rows
+    ]
+    hits = plot.known_hits(
+        rows,
+        alleles,
+        hap_symbols={
+            f"{r['functional_gene']}_hap1": r["functional_gene"] for r in rows
+        },
+    )
+    assert [h[5] for h in hits] == [r["label"] for r in rows]
+    assert all(h[7].startswith("PMID:") for h in hits)

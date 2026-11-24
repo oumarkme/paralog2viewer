@@ -547,3 +547,71 @@ def test_publish_figures_updates_existing_dir_in_place(tmp_path):
     assert sorted(p.name for p in final.iterdir()) == ["geneA.jpeg"]
     assert (final / "geneA.jpeg").read_bytes() == b"new"
     assert not leftover.exists()
+
+
+def test_summary_is_written_and_a_summary_error_never_fails_the_run(
+    env, monkeypatch
+):
+    install_fakes(monkeypatch, env)
+    # Fake inputs are not real files, so the summary cannot be built.
+    result = runner.run_pipeline(env.settings(tmp=env.tmp))
+    assert result.ok
+    assert not (env.out / "S1" / "paralog2viewer_summary.html").exists()
+    # No page: the figures are kept as files instead of being lost.
+    assert (env.out / "S1" / "figures" / "geneA.jpeg").exists()
+    # With working inputs the page is written and listed as an output.
+    seen = {}
+
+    def fake_summary(out_path, **kwargs):
+        seen.update(kwargs)
+        return _touch(Path(out_path))
+
+    monkeypatch.setattr(runner.summary, "write_summary", fake_summary)
+    monkeypatch.setattr(plot, "read_alleles", lambda *a, **k: [])
+    monkeypatch.setattr(plot, "read_known", lambda path: [])
+    result = runner.run_pipeline(env.settings(tmp=env.tmp, resume=False))
+    page = env.out / "S1" / "paralog2viewer_summary.html"
+    assert result.ok and page in result.outputs
+    # The page embeds the figures: no figures/ folder, and a stale one of
+    # an earlier run is gone. The page reads them from the work directory.
+    assert not (env.out / "S1" / "figures").exists()
+    assert seen["figures_dir"].name == "figures"
+    assert env.out not in seen["figures_dir"].parents
+    assert seen["sample"] == "S1" and seen["known_hits"] == []
+
+
+def test_summary_skipped_when_not_in_format(env, monkeypatch):
+    install_fakes(monkeypatch, env)
+    called = []
+    monkeypatch.setattr(
+        runner.summary, "write_summary", lambda *a, **k: called.append(1)
+    )
+    result = runner.run_pipeline(
+        env.settings(formats=("vcf", "mviewer"), tmp=env.tmp)
+    )
+    assert result.ok and not called
+
+
+def test_stale_page_is_removed_and_an_aborted_run_still_gets_a_page(
+    env, monkeypatch
+):
+    install_fakes(monkeypatch, env)
+    stale = env.out / "S1" / "paralog2viewer_summary.html"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale")
+    # The fake inputs cannot be summarised: the old page must still go.
+    runner.run_pipeline(env.settings(tmp=env.tmp))
+    assert not stale.exists()
+    # Abort after the split: the summary is written from what exists.
+    monkeypatch.setattr(split, "split_haplotypes", lambda *a, **k: [])
+    seen = {}
+
+    def fake_summary(out_path, **kwargs):
+        seen.update(kwargs)
+        return _touch(Path(out_path))
+
+    monkeypatch.setattr(runner.summary, "write_summary", fake_summary)
+    with pytest.raises(runner.PipelineError):
+        runner.run_pipeline(env.settings(tmp=env.tmp, resume=False))
+    assert "no haplotype with confident reads" in seen["failures"]["run"]
+    assert stale.exists()

@@ -6,18 +6,18 @@ import pytest
 from paralog2viewer import cli, config, dataprep, rccx, runner
 
 
-def test_version_prints_0_9_0(capsys):
+def test_version_prints_1_0_0(capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main(["--version"])
     assert exc.value.code == 0
-    assert capsys.readouterr().out.strip() == "paralog2viewer 0.9.0"
+    assert capsys.readouterr().out.strip() == "paralog2viewer 1.0.0"
 
 
-def test_run_defaults_both_formats_and_figures():
+def test_run_defaults_all_formats_and_figures():
     args = cli.build_parser().parse_args(
         ["run", "--bam", "a.bam", "--data", "d"]
     )
-    assert args.formats == ("vcf", "mviewer")
+    assert args.formats == ("vcf", "mviewer", "summary")
     assert args.figures is True
     assert args.threads is None and args.memory is None
     assert args.resume is True and args.dry_run is False

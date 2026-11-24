@@ -37,6 +37,7 @@ from typing import Any
 import pysam
 
 from paralog2viewer import (
+    __version__,
     annotate,
     call,
     config,
@@ -48,6 +49,7 @@ from paralog2viewer import (
     realign,
     scheduler,
     split,
+    summary,
     vcf_out,
 )
 from paralog2viewer.datalayout import DataLayout
@@ -300,6 +302,8 @@ def plan_lines(settings: config.RunSettings, info: Inputs) -> list[str]:
                 f"[7] classify_rccx + plot_rccx_module -> "
                 f"{out / 'figures' / 'RCCX_module.jpeg'}"
             )
+    if "summary" in settings.formats:
+        lines.append(f"[8] write_summary -> {out / summary.SUMMARY_NAME}")
     return lines
 
 
@@ -576,21 +580,42 @@ def run_pipeline(settings: config.RunSettings) -> RunResult:
                 max_memory_gb=settings.memory_gb,
                 resume=settings.resume,
             )
+            ctx: dict[str, Any] = {}
+            if "summary" in settings.formats:
+                # A page left by an earlier run must not pass for this one.
+                (out_dir / summary.SUMMARY_NAME).unlink(missing_ok=True)
+                (out_dir / f"{summary.SUMMARY_NAME}.part").unlink(
+                    missing_ok=True
+                )
             try:
-                _execute(settings, info, work, out_dir, pool, result)
+                _execute(settings, info, work, out_dir, pool, result, ctx)
+            except Exception as err:
+                result.failures.setdefault("run", str(err))
+                raise
             finally:
+                if "summary" in settings.formats:
+                    page = _write_summary(
+                        settings, info, work, out_dir, result, ctx
+                    )
+                    if page is not None:
+                        result.outputs.append(page)
+                    elif ctx.get("figures") is not None:
+                        # No page: keep the figures as files instead.
+                        _publish_figures(
+                            ctx["figures_stage"], ctx["figures_final"]
+                        )
                 total_wall = time.monotonic() - started
                 # Kept in the work directory for profiling, not published.
                 scheduler.write_timings(
                     work / "timings.tsv", pool.timings, total_wall
                 )
-                summary = scheduler.summarize_timings(pool.timings, total_wall)
+                timing = scheduler.summarize_timings(pool.timings, total_wall)
                 LOGGER.info(
                     "run summary: wall %.1f s; CPU %.1f s executed, "
                     "%.1f s cached (stored from earlier runs)",
-                    summary["total_wall_s"],
-                    summary["cpu_s_executed"],
-                    summary["cpu_s_cached"],
+                    timing["total_wall_s"],
+                    timing["cpu_s_executed"],
+                    timing["cpu_s_cached"],
                 )
     except scheduler.LockedError as err:
         raise PipelineError(str(err)) from err
@@ -643,9 +668,15 @@ def _execute(
     out_dir: Path,
     pool: scheduler.Pool,
     result: RunResult,
+    ctx: dict[str, Any],
 ) -> None:
-    """Steps [1] to [7] under the pool; fills ``result``."""
+    """Steps [1] to [7] under the pool; fills ``result``.
+
+    ``ctx`` receives ``jobs``, ``results`` and ``figures`` for the summary,
+    also when a later step raises.
+    """
     jobs = pool.run([_split_task(settings, info, work)]).results["split"]
+    ctx["jobs"] = jobs
     if not jobs:
         raise PipelineError("no haplotype with confident reads in the JSON")
 
@@ -678,19 +709,130 @@ def _execute(
     final = pool.run(
         _output_tasks(settings, info, work, out_dir, jobs, good, fig_dir)
     )
+    ctx["results"] = final.results
     for key, message in final.failures.items():
         if not message.startswith("cancelled"):
             result.failures[key] = message
-    swapped = (
-        settings.figures
-        and not any(k in final.failures for k in ("figures", "rccx"))
-        and _publish_figures(fig_dir, fig_final)
+    figs_ok = settings.figures and not any(
+        k in final.failures for k in ("figures", "rccx")
     )
+    # With the summary page the figures live in the page (each has a
+    # Download link): no ``figures/`` folder, and none left by an earlier
+    # run. The page reads them from the work directory.
+    in_page = "summary" in settings.formats
+    swapped = figs_ok and not in_page and _publish_figures(fig_dir, fig_final)
+    if in_page:
+        _remove_figures(fig_final)
+    ctx["figures"] = (
+        fig_final
+        if swapped
+        else fig_dir
+        if figs_ok and in_page and fig_dir.is_dir()
+        else None
+    )
+    ctx["figures_final"] = fig_final
+    ctx["figures_stage"] = fig_dir
     for key in ("vcf", "mviewer", "figures", "rccx"):
         paths = _paths_of(final.results.get(key))
-        if swapped and key in ("figures", "rccx") and key in final.results:
+        if key in ("figures", "rccx") and key in final.results:
+            if not swapped:
+                continue
             paths = [fig_final / p.relative_to(fig_dir) for p in paths]
         result.outputs += paths
+
+
+def _remove_figures(final: Path) -> None:
+    """Deletes the JPEGs of an earlier run and the folder if it is empty."""
+    if not final.is_dir():
+        return
+    for path in [*final.glob("*.jpeg"), *final.glob("*.part")]:
+        path.unlink(missing_ok=True)
+    try:
+        final.rmdir()
+    except OSError:
+        pass
+
+
+def rccx_symbols(info: Inputs) -> dict[str, str]:
+    """Returns HP -> CYP21 gene of the RCCX haplotypes (empty if none)."""
+    if not info.has_rccx:
+        return {}
+    try:
+        return rccx.cyp21_symbols(info.json_path)
+    except (KeyError, ValueError, OSError) as err:
+        LOGGER.warning("RCCX gene symbols unavailable: %s", err)
+        return {}
+
+
+def _rccx_roles(symbols: Mapping[str, str]) -> dict[str, str]:
+    """HP -> "gene" (distal CYP21 copy) or "pseudogene" (proximal copy)."""
+    prox = rccx.load_gene_table().pair("CYP21")[0].name
+    return {
+        hp: "pseudogene" if sym == prox else "gene"
+        for hp, sym in symbols.items()
+    }
+
+
+def _write_summary(
+    settings: config.RunSettings,
+    info: Inputs,
+    work: Path,
+    out_dir: Path,
+    result: RunResult,
+    ctx: Mapping[str, Any],
+) -> Path | None:
+    """Writes the HTML summary; a problem is logged, never raised."""
+    try:
+        jobs = ctx.get("jobs") or []
+        results = ctx.get("results") or {}
+        fig_dir = ctx.get("figures")
+        merged, annotated = results.get("merge"), results.get("annotate")
+        table = out_dir / f"{info.sample}.paralog.tsv.gz"
+        if "mviewer" not in settings.formats or "mviewer" not in results:
+            table = None
+            if merged is not None and annotated is not None:
+                table = work / "summary_table.tsv.gz"
+                mviewer_table.write_mviewer_table(
+                    annotated, merged, info.sample, info.sex, table
+                )
+        region_of = {j.hp: j.region for j in jobs}
+        roles = plot.load_roles()
+        hap_symbol = {}
+        hap_role = {}
+        for j in jobs:
+            role = plot.resolve_role(j.hp, roles, j.region)
+            hap_role[j.hp] = role.role
+            if role.role == "gene":
+                hap_symbol[j.hp] = role.symbol
+        hits: list[tuple] = []
+        known = pseudogene_path(settings)
+        if merged is not None and known.is_file():
+            symbols = rccx_symbols(info)
+            hap_symbol.update(symbols)
+            hap_role.update(_rccx_roles(symbols))
+            hits = plot.known_hits(
+                plot.read_known(known),
+                plot.read_alleles(merged, set()),
+                region_of,
+                roles,
+                symbols,
+            )
+        return summary.write_summary(
+            out_dir / summary.SUMMARY_NAME,
+            sample=info.sample,
+            version=__version__,
+            work_dir=work,
+            failures=result.failures,
+            table_path=table,
+            paraphase_json=info.json_path,
+            known_hits=hits,
+            hap_symbol=hap_symbol,
+            hap_role=hap_role,
+            figures_dir=fig_dir,
+        )
+    except Exception as err:  # noqa: BLE001 - the summary never fails a run
+        LOGGER.warning("summary page not written: %s", err)
+        return None
 
 
 def _output_tasks(
@@ -827,6 +969,7 @@ def _figures_task(
             gene_models=gene_models,
             default_transcripts=layout.default_transcript,
             hap_info=info.json_path,
+            hap_symbols=rccx_symbols(info),
         )
 
     return _output_task(

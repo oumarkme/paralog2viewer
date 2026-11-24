@@ -27,7 +27,7 @@ import string
 import zlib
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import matplotlib
@@ -44,6 +44,7 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator  # noqa: E402
 
 from paralog2viewer.datalayout import allele_key, bare_chrom  # noqa: E402
 from paralog2viewer.figstyle import (  # noqa: E402
+    FIGURE_DPI,
     FONT_PT,
     MIXED_COLOR,
     ROLE_COLOR,
@@ -160,29 +161,125 @@ def _read_tsv(path: Path | str) -> list[dict[str, str]]:
         return list(csv.DictReader(lines, delimiter="\t"))
 
 
-def read_known(path: Path | str) -> list[Allele]:
-    """Read pseudogene-type alleles from known_gene_pseudogene_variants.tsv.
+KNOWN_COLUMNS = (
+    "functional_gene",
+    "hgvs",
+    "label",
+    "chrom",
+    "pos",
+    "ref",
+    "alt",
+    "reference",
+)
+
+
+def read_known(path: Path | str) -> list[dict[str, str]]:
+    """Read known_gene_pseudogene_variants.tsv.
 
     Args:
-        path: Tab-separated file; ``#`` lines are comments; needs columns
-            chrom, pos (1-based), ref, alt, label.
+        path: Tab-separated file; ``#`` lines are comments; needs the
+            columns in ``KNOWN_COLUMNS`` (pos is 1-based).
 
     Returns:
-        One Allele per row, with ``haps`` empty (set per locus later).
+        One dict per row with all columns of the file (strings).
+
+    Raises:
+        ValueError: If a required column is missing or a pos is not an
+            integer; the message names the file, column or row.
+    """
+    with open(path, newline="", encoding="utf-8") as handle:
+        lines = (ln for ln in handle if not ln.startswith("#"))
+        reader = csv.DictReader(lines, delimiter="\t")
+        header = reader.fieldnames or []
+        rows = list(reader)
+    missing = [c for c in KNOWN_COLUMNS if c not in header]
+    if missing:
+        raise ValueError(f"{path}: missing column(s) {', '.join(missing)}")
+    for number, row in enumerate(rows, start=1):
+        if not row["pos"].isdigit():
+            raise ValueError(f"{path}: row {number}: pos {row['pos']!r}")
+    return rows
+
+
+def known_hits(
+    known_rows: Sequence[Mapping[str, str]],
+    alleles: Sequence[Allele],
+    region_of: Mapping[str, str] | None = None,
+    roles: Mapping[tuple[str, str], HapRole] | None = None,
+    hap_symbols: Mapping[str, str] | None = None,
+) -> list[tuple[str, str, int, str, str, str, str, str]]:
+    """List known gene/pseudogene variants present in the merged VCF.
+
+    A row is a hit when an allele has the identical chrom, pos, ref and
+    alt and at least one haplotype carrying it belongs to the row's
+    ``functional_gene``: role ``gene`` and the same symbol in the
+    haplotype role table, or the symbol given in ``hap_symbols``. A
+    haplotype with no resolved role (for example NCF1 copies) never
+    qualifies, so a pseudogene copy is not mistaken for the gene. The
+    allele is the pseudogene-type allele inside the functional gene.
+
+    Args:
+        known_rows: Output of ``read_known``.
+        alleles: Output of ``read_alleles`` (haplotypes that carry them).
+        region_of: Optional HP -> region name for roles of HP names
+            without a region part.
+        roles: Role table (``load_roles``); default the packaged one.
+        hap_symbols: Optional HP -> gene symbol that replaces the role
+            table (used for RCCX haplotypes, see ``rccx.cyp21_symbols``).
+
+    Returns:
+        (gene, chrom, pos, ref, alt, label, hgvs, reference) per hit, in
+        file order.
     """
     return [
-        Allele(
+        (
+            row["functional_gene"],
             row["chrom"],
-            int(row["pos"]),
             int(row["pos"]),
             row["ref"],
             row["alt"],
-            False,
-            frozenset(),
-            label=row["label"],
+            row["label"],
+            row["hgvs"],
+            row["reference"],
         )
-        for row in _read_tsv(path)
+        for row, _allele, _haps in _known_carriers(
+            known_rows, alleles, region_of, roles, hap_symbols
+        )
     ]
+
+
+def _known_carriers(
+    known_rows: Sequence[Mapping[str, str]],
+    alleles: Sequence[Allele],
+    region_of: Mapping[str, str] | None,
+    roles: Mapping[tuple[str, str], HapRole] | None,
+    hap_symbols: Mapping[str, str] | None = None,
+) -> list[tuple[Mapping[str, str], Allele, frozenset[str]]]:
+    """Return (row, allele, carrier haplotypes of the functional gene)."""
+    table = roles if roles is not None else _default_roles()
+    region_of = region_of or {}
+    hap_symbols = hap_symbols or {}
+
+    def symbol_of(hap: str) -> str:
+        if hap in hap_symbols:
+            return hap_symbols[hap].upper()
+        role = resolve_role(hap, table, region_of.get(hap, ""))
+        return role.symbol.upper() if role.role == "gene" else ""
+
+    by_site: dict[tuple[str, int, str, str], list[Allele]] = (
+        collections.defaultdict(list)
+    )
+    for a in alleles:
+        by_site[(a.chrom, a.pos, a.ref, a.alt)].append(a)
+    found = []
+    for row in known_rows:
+        gene = row["functional_gene"].upper()
+        site = (row["chrom"], int(row["pos"]), row["ref"], row["alt"])
+        for a in by_site.get(site, ()):
+            carriers = frozenset(h for h in a.haps if symbol_of(h) == gene)
+            if carriers:
+                found.append((row, a, carriers))
+    return found
 
 
 def read_alleles(
@@ -802,7 +899,7 @@ def _set_style() -> None:
             "xtick.major.size": 2.0,
             "ytick.major.width": 0.5,
             "ytick.major.size": 1.5,
-            "figure.dpi": 300,
+            "figure.dpi": FIGURE_DPI,
         }
     )
 
@@ -1146,7 +1243,7 @@ def draw_locus(
     max_reads: int = MAX_READS,
     subtitle: str = "",
 ) -> Path:
-    """Render one locus to a JPEG (300 dpi, 180 mm wide).
+    """Render one locus to a JPEG (150 dpi, 180 mm wide).
 
     Layout, top to bottom, one shared x axis (GRCh38 bp): gene track,
     allele track, one band per haplotype (coverage plus packed reads),
@@ -1158,7 +1255,8 @@ def draw_locus(
         locus: Dict from ``cluster_loci``.
         reads: HP -> reads.
         alleles: Called alleles (any locus; filtered here).
-        known: Pseudogene-type alleles from the TSV.
+        known: Known-variant hits as alleles (haps = carrier haplotypes,
+            end = pos + len(ref) - 1); see ``plot_regions``.
         target: Output JPEG path.
         hap_roles: HP -> HapRole; default: parsed from the HP names.
         hap_info: HP -> dict from ``load_hap_info`` (truncation, copies).
@@ -1189,18 +1287,12 @@ def draw_locus(
     sep_ids = {id(v) for v in discr}
     plp = [v for v in here if v.plp]
     known_here = [
-        Allele(
-            k.chrom,
-            k.pos,
-            k.end,
-            k.ref,
-            k.alt,
-            False,
-            frozenset(names),
-            label=k.label,
-        )
+        replace(k, haps=k.haps & nameset)
         for k in known
-        if k.chrom == chrom and x_lo < k.pos <= x_hi
+        if k.chrom == chrom
+        and k.pos <= x_hi
+        and k.end > x_lo
+        and k.haps & nameset
     ]
     known_ids = {id(k) for k in known_here}
     relevant = sorted(
@@ -1498,8 +1590,8 @@ def draw_locus(
     fig.savefig(
         target,
         format="jpeg",
-        dpi=300,
-        pil_kwargs={"quality": 95, "dpi": (300, 300)},
+        dpi=FIGURE_DPI,
+        pil_kwargs={"quality": 95, "dpi": (FIGURE_DPI, FIGURE_DPI)},
     )
     plt.close(fig)
     return target
@@ -1630,6 +1722,7 @@ def plot_regions(
     hap_info: Mapping[str, dict] | Path | str | None = None,
     haplotype_roles: Path | str | None = None,
     max_reads: int = MAX_READS,
+    hap_symbols: Mapping[str, str] | None = None,
 ) -> list[Path]:
     """Write one read-pileup JPEG per region (or per locus).
 
@@ -1655,6 +1748,8 @@ def plot_regions(
             haplotype_roles.tsv.
         max_reads: Reads drawn per haplotype (seeded random sample; the
             label states the true number).
+        hap_symbols: Optional HP -> gene symbol for known-variant markers
+            where the role table has no rows (RCCX).
 
     Returns:
         Written JPEG paths, sorted by name.
@@ -1672,7 +1767,29 @@ def plot_regions(
     if missing:
         raise ValueError(f"VCF contigs not in reference: {sorted(missing)}")
     alleles = read_alleles(merged_vcf, pathogenic_keys, allele_labels)
-    known = read_known(pseudogene_tsv)
+    hap_region = {
+        h: region_of[h] if region_of else default_region(h) for h in hap_dirs
+    }
+    known_rows = read_known(pseudogene_tsv)
+    known = [
+        Allele(
+            a.chrom,
+            a.pos,
+            a.pos + len(a.ref) - 1,
+            a.ref,
+            a.alt,
+            False,
+            haps,
+            label=row["label"],
+        )
+        for row, a, haps in _known_carriers(
+            known_rows,
+            alleles,
+            hap_region,
+            load_roles(haplotype_roles) if haplotype_roles else None,
+            hap_symbols,
+        )
+    ]
     if isinstance(hap_info, (str, Path)):
         hap_info = load_hap_info(hap_info)
     by_region: dict[str, dict[str, str]] = collections.defaultdict(dict)
