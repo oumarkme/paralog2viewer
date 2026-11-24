@@ -1270,6 +1270,7 @@ def _build_figure(
         )
         for f in families
     }
+    ax.text(-1.5, schema_h - 1.0, "Gene", ha="right", va="top")
     for k in range(slots):
         for j, family in enumerate(families):
             x = k * (n_boxes * (box_w + box_gap) - box_gap + mod_gap) + j * (
