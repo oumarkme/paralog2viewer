@@ -82,7 +82,7 @@ jobs:
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - run: |
           { printf -- '---\nlayout: default\ntitle: paralog2viewer\n---\n\n'
-            sed 's#](docs/images/#](images/#g' README.md; cat docs/mermaid.html; } > docs/index.md
+            sed 's#](docs/\(images\|examples\)/#](\1/#g' README.md; cat docs/mermaid.html; } > docs/index.md
       - uses: actions/jekyll-build-pages@44a6e6beabd48582f863aeeb6cb2151cc1716697 # v1.0.13
         with:
           source: ./docs

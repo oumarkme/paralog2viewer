@@ -21,7 +21,7 @@ import gzip
 import html
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
 from paralog2viewer.annotate import PLP_CLINVAR, PLP_INTERVAR
@@ -180,15 +180,15 @@ def _site(chrom: str, pos: int, ref: str, alt: str) -> tuple:
 # ----------------------------------------------------------------- inputs
 
 
-def load_table(path: Path | str | None) -> list[dict[str, str]]:
-    """Read the 365-column table (gzip or plain; ``#`` lines skipped)."""
+def load_table(path: Path | str | None) -> Iterator[dict[str, str]]:
+    """Yield rows of the 365-column table (gzip or plain; ``#`` skipped)."""
     if not path or not Path(path).is_file():
-        return []
+        return
     path = Path(path)
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8", newline="") as handle:
         lines = (ln for ln in handle if not ln.startswith("#"))
-        return list(csv.DictReader(lines, delimiter="\t"))
+        yield from csv.DictReader(lines, delimiter="\t")
 
 
 def _read_json(path: Path) -> dict:
@@ -304,7 +304,6 @@ def build_model(
             "flagged": [],
             "tiers": collections.Counter(),
             "figures": [],
-            "haps": [],
         }
         if expected is not None and expected != copies:
             genes[name]["status"] = "review"
@@ -316,7 +315,6 @@ def build_model(
         gene = genes.get(h.get("region"))
         if gene is None:
             continue
-        gene["haps"].append(h.get("hap"))
         reads = h.get("matched_primary_read_ids")
         gene["reads"] += reads if isinstance(reads, int) else 0
         if h.get("status") != "ready":
@@ -343,20 +341,14 @@ def build_model(
     )
     _attach_figures(genes, figures_dir)
 
-    def _n(gene: Mapping, tier: str) -> int:
-        return sum(n for (t, _r), n in gene["tiers"].items() if t == tier)
-
     # P, then LP, then notes (flag and CN notes, failures), then name.
-    ordered = sorted(
-        genes.values(),
-        key=lambda g: (
-            -_n(g, "P"),
-            -_n(g, "LP"),
-            -(_n(g, "note") + sum(not n.startswith("CN ") for n in g["notes"])),
-            g["name"],
-        ),
-    )
-    rccx = _read_rccx(Path(work_dir) / "rccx_calls.tsv")
+    def rank(gene: Mapping) -> tuple:
+        n = _tier_counts(gene["tiers"])
+        other = sum(not x.startswith("CN ") for x in gene["notes"])
+        return (-n["P"], -n["LP"], -(n["note"] + other), gene["name"])
+
+    ordered = sorted(genes.values(), key=rank)
+    has_rccx = (Path(work_dir) / "rccx_calls.tsv").is_file()
     if steps:
         problems.append("failed: " + "; ".join(steps))
     if any(g["status"] == "problem" for g in ordered) or problems:
@@ -382,7 +374,7 @@ def build_model(
         "reviews": reviews,
         "no_haps": sorted(no_haps),
         "overall": overall,
-        "rccx": rccx,
+        "has_rccx": has_rccx,
         "figures_dir": figures_dir,
     }
 
@@ -457,14 +449,6 @@ def _attach_figures(genes: dict[str, dict], figures_dir: Path | None) -> None:
             if stem == name or stem.startswith(name + "_"):
                 genes[name]["figures"].append(path)
                 break
-
-
-def _read_rccx(path: Path) -> list[dict[str, str]] | None:
-    """Return the RCCX call rows, or None if the run had no RCCX table."""
-    if not path.is_file():
-        return None
-    with open(path, encoding="utf-8", newline="") as handle:
-        return list(csv.DictReader(handle, delimiter="\t"))
 
 
 # ------------------------------------------------------------------ HTML
@@ -773,8 +757,7 @@ def _no_haps_section(model: Mapping) -> str:
 
 
 def _rccx_section(model: Mapping) -> str:
-    rows = model["rccx"]
-    if rows is None:
+    if not model["has_rccx"]:
         return ""
     out = [
         "<h2>RCCX</h2>",

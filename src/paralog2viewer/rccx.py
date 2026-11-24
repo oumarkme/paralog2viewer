@@ -933,11 +933,7 @@ def classify_rccx(
             else:
                 position = "proximal"
             tied = n_distal if is_distal(hap) else n_mod - n_distal
-            first_slot = order - sum(
-                1
-                for h in ordered[: order - 1]
-                if is_distal(h) == is_distal(hap)
-            )
+            first_slot = n_mod - n_distal + 1 if is_distal(hap) else 1
             slots = (
                 str(order)
                 if tied == 1 or not listed

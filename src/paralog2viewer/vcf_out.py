@@ -94,8 +94,6 @@ FULL_ANNOVAR_FIELDS: tuple[str, ...] = (
     "AlphaMissense_score",
     "AlphaMissense_pred",
 )
-# Never written to the VCF.
-WITHHELD_RECORD_KEYS = ("hgmd_class", "taiwan_biobank")
 
 _BAD_CHARS = re.compile(r"[;=,|\s]|%(?![0-9A-Fa-f]{2})")
 

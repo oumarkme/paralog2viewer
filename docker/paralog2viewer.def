@@ -6,7 +6,7 @@ Bootstrap: docker
 From: mambaorg/micromamba:2.9.0-debian13-slim
 
 %labels
-    Description paralog2viewer 0.9.0 runtime (open-source tools only)
+    Description paralog2viewer runtime (open-source tools only)
     Clair3Version 2.0.3
     SawfishVersion 2.2.1
     VEPVersion 116.1

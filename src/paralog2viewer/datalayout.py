@@ -105,21 +105,6 @@ class DataLayout:
         return self.profile / "DefaultTranscript.tsv"
 
     @property
-    def comments(self) -> Path:
-        """Curated comments table."""
-        return self.profile / "Comments.tsv"
-
-    @property
-    def methylated(self) -> Path:
-        """Methylated loci table."""
-        return self.profile / "Methylated.tsv"
-
-    @property
-    def variant_catalog(self) -> Path:
-        """Variant catalog JSON."""
-        return self.profile / "variant_catalog.json"
-
-    @property
     def rccx_sites(self) -> Path:
         """Precomputed RCCX discriminating sites (TSV)."""
         return self.root / "rccx" / "discriminating_sites.tsv"

@@ -6,11 +6,12 @@ import pytest
 from paralog2viewer import cli, config, dataprep, rccx, runner
 
 
-def test_version_prints_1_0_0(capsys):
+def test_version_prints_the_version_file(capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main(["--version"])
     assert exc.value.code == 0
-    assert capsys.readouterr().out.strip() == "paralog2viewer 1.0.0"
+    version = (Path(__file__).parents[1] / "VERSION").read_text().strip()
+    assert capsys.readouterr().out.strip() == f"paralog2viewer {version}"
 
 
 def test_run_defaults_all_formats_and_figures():
