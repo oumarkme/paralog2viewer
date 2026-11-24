@@ -1,0 +1,14 @@
+
+<!-- Appended to index.md by CI: draws the README flowchart (kramdown emits
+     it as <pre><code class="language-mermaid">). Mermaid version pinned. -->
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@12.3.0/dist/mermaid.esm.min.mjs";
+  for (const code of document.querySelectorAll("pre > code.language-mermaid")) {
+    const div = document.createElement("div");
+    div.className = "mermaid";
+    div.textContent = code.textContent;
+    code.parentElement.replaceWith(div);
+  }
+  mermaid.initialize({ startOnLoad: false, theme: "neutral" });
+  await mermaid.run({ querySelector: "div.mermaid" });
+</script>

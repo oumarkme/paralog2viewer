@@ -1,0 +1,12 @@
+# Allow-list: only what the image build needs.
+*
+!pyproject.toml
+!VERSION
+!README.md
+!LICENSE
+!src/
+!tests/
+**/__pycache__
+**/*.egg-info
+**/.pytest_cache
+**/.ruff_cache
